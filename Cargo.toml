@@ -1,0 +1,87 @@
+[package]
+name = "claude-sidecar"
+version = "3.0.0"
+edition = "2021"
+description = "Localhost HTTP sidecar that runs allowlisted build/test commands outside a sandbox for coding agents, with create-then-poll job streaming and live SSE."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["sandbox", "sidecar", "subprocess", "pty", "claude"]
+categories = ["command-line-utilities", "web-programming::http-server", "development-tools"]
+repository = "https://github.com/EtaCassiopeia/claude-sidecar"
+
+[lib]
+name = "claude_sidecar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "claude-sidecar"
+path = "src/main.rs"
+
+[[bin]]
+name = "sidecar-tui"
+path = "src/bin/tui.rs"
+required-features = ["tui"]
+
+[features]
+tui = [
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:reqwest",
+    "dep:reqwest-eventsource",
+    "dep:futures",
+    "dep:tokio-util",
+    "dep:color-eyre",
+]
+
+[dependencies]
+# HTTP framework — routing, extractors, JSON, and native SSE.
+axum = "0.7"
+
+# Async runtime.
+tokio = { version = "1", features = ["full"] }
+# Adapts channels/receivers into the `Stream` the SSE handler yields.
+async-stream = "0.3"
+
+# PTY support via nix + raw libc for setsid/killpg on timeout.
+nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }
+libc = "0.2"
+
+# Serialization. `rc` lets us serialize `Arc<JobLine>` directly (the line buffer
+# is shared between the history vec and live broadcast).
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+
+# Job IDs.
+uuid = { version = "1", features = ["v4"] }
+
+# Logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors.
+thiserror = "1"
+anyhow = "1"
+
+# CLI.
+clap = { version = "4", features = ["derive", "env"] }
+
+# TUI (optional — enabled by the `tui` feature).
+ratatui             = { version = "0.30", optional = true }
+crossterm           = { version = "0.29", optional = true, features = ["event-stream"] }
+reqwest             = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest-eventsource = { version = "0.6", optional = true }
+futures             = { version = "0.3", optional = true }
+tokio-util          = { version = "0.7", optional = true }
+color-eyre          = { version = "0.6", optional = true }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` for driving the router in HTTP-level tests.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
