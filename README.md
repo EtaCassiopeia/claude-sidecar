@@ -58,6 +58,40 @@ claude-sidecar                 # listen on 127.0.0.1:8765
 claude-sidecar -v --port 9000  # verbose, custom port
 ```
 
+## Claude Code integration
+
+The sidecar is useless to an agent that doesn't know it exists. `./install.sh`
+wires it into Claude Code in three places, all idempotent — re-run it any time
+to refresh:
+
+| What | Where | Source of truth |
+|---|---|---|
+| Instructions telling Claude when to route through the sidecar | `~/.claude/CLAUDE.md` | `assets/claude-md-block.md` |
+| `PreToolUse` hook that intercepts blocked/long Bash calls and points Claude here | `~/.claude/hooks/` + `~/.claude/settings.json` | `assets/sidecar-redirect.py` |
+| Auto-start on shell login, plus `~/.local/bin` on `PATH` | your shell rc | — |
+
+**Both assets are canonical — edit them here, not in `~/.claude/`.** The
+installer replaces the existing CLAUDE.md block by matching its first heading
+(`# Sidecar — Running Blocked or Long Commands`), so edits made directly in
+`~/.claude/CLAUDE.md` are overwritten on the next `./install.sh`. Changing the
+API without updating `assets/claude-md-block.md` leaves every future session
+following stale instructions.
+
+Manual setup, if you'd rather not run the installer:
+
+```bash
+cargo build --release && cp target/release/claude-sidecar ~/.local/bin/
+cat assets/claude-md-block.md >> ~/.claude/CLAUDE.md
+```
+
+Then start it (`claude-sidecar &`) and confirm Claude can see it — ask it to
+run `curl -s http://localhost:8765/health`. The hook is optional; without it
+Claude follows the CLAUDE.md decision tree on its own, it just isn't nudged
+when the sandbox blocks something.
+
+Per-project instead of global? Put the block in a project's `./CLAUDE.md`
+rather than `~/.claude/CLAUDE.md` — same content, narrower scope.
+
 ## Configuration
 
 Every flag has an environment-variable equivalent.
