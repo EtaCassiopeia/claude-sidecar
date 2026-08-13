@@ -169,17 +169,40 @@ readable, which plain `curl` can't do.
 curl -s -X POST http://localhost:8765/browser/fetch \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://medium.com/some-paywalled-article"}'
-# {"url":"…","title":"…","content":"rendered page text"}
+# {"url":"…","title":"…","content":"# Heading\n\nArticle text…","truncated":false}
 ```
 
-Options: `wait_secs` (max page-load wait, default 20, cap 120), `format`
-(`"text"` = `innerText`, default; `"html"` = full DOM), `keep_tab` (leave the
-tab open, default false).
+Options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `format` | `"markdown"` | `"markdown"` = main content as markdown; `"text"` = whole-page `innerText`; `"html"` = full DOM |
+| `max_chars` | none | Cap the content; sets `truncated: true` when it bites |
+| `include_links` | `false` | Keep link/image targets in markdown (link text is always kept) |
+| `wait_secs` | `20` | Max page-load wait, cap 120 |
+| `keep_tab` | `false` | Leave the tab open (useful to see what actually rendered) |
+
+**On `markdown`.** The extractor drops site chrome — nav, cookie banners,
+related-article rails, comments — then serializes what's left, keeping
+headings, lists, tables, and fenced code with language tags. Measured against
+`innerText`: −10% on a Cloudflare blog post, −16% on MDN and the Rust book,
+−77% on a chrome-heavy landing page, and roughly break-even on a long Wikipedia
+article, where markdown's table scaffolding offsets what the strip pass removes.
+Structure is the bigger win; the size drop is a bonus, not a step change —
+`innerText` is already a decent extractor.
+
+Link targets are excluded by default because they cost more than they return:
+turning `include_links` on grows the MDN page from 13k to 21k characters, and a
+Wikipedia article by 40%. Turn it on when the agent needs to follow links.
+
+If the extractor picks the wrong block on some page, fall back to
+`"format":"text"`.
 
 ### `GET /browser/tab` — read the currently focused tab (macOS)
 
 Returns the page the user is looking at right now — navigate somewhere
-yourself, then have the agent read it. Takes `?format=text|html`.
+yourself, then have the agent read it. Takes the same `format`, `max_chars`,
+and `include_links` options as query parameters.
 
 ### Browser bridge setup (one-time)
 
