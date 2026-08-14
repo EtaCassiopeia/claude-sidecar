@@ -80,7 +80,15 @@ const INTERPRETER_EXEC_FLAGS: &[&str] = &[
 
 /// Commands that are scripting interpreters and must have their arguments
 /// checked for inline-execution flags.
-const INTERPRETER_COMMANDS: &[&str] = &["python3", "node", "perl", "ruby", "sh", "bash", "zsh"];
+///
+/// The POSIX shells (`sh`, `bash`, `zsh`) are intentionally *not* here: callers
+/// are permitted to run `bash -c "<compound command>"`, so their `-c` string is
+/// passed through unchecked. Note that this makes the top-level command
+/// allowlist advisory rather than enforcing — a `bash -c` string can invoke any
+/// binary on the machine, including ones not in `ALLOWED_COMMANDS`. This matches
+/// the capability already reachable through the allowlisted `python3`, `node`,
+/// `docker`, and `curl`, and is enabled deliberately.
+const INTERPRETER_COMMANDS: &[&str] = &["python3", "node", "perl", "ruby"];
 
 /// Check whether a command name is on the allowlist.
 pub fn is_allowed(cmd: &str) -> bool {
@@ -218,6 +226,21 @@ mod tests {
         // `git -c` sets a config value — not an exec flag, must not be blocked.
         assert!(check_args("git", &args(&["-c", "user.email=x@y.com", "commit"])).is_ok());
         assert!(check_args("cargo", &args(&["test", "--", "-c"])).is_ok());
+    }
+
+    #[test]
+    fn shell_dash_c_allowed() {
+        // Shells are deliberately excluded from the interpreter set: `bash -c`
+        // (and `sh -c`) may run a compound command string.
+        assert!(check_args("bash", &args(&["-c", "git status && ls"])).is_ok());
+        assert!(check_args("sh", &args(&["-c", "echo hi | wc -l"])).is_ok());
+    }
+
+    #[test]
+    fn interpreter_exec_flags_still_blocked_for_non_shells() {
+        // The relaxation is shells-only; python3/node inline exec stays blocked.
+        assert!(check_args("python3", &args(&["-c", "import os; os.system('id')"])).is_err());
+        assert!(check_args("node", &args(&["-e", "process.exit(0)"])).is_err());
     }
 
     #[test]

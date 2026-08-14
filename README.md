@@ -58,6 +58,40 @@ claude-sidecar                 # listen on 127.0.0.1:8765
 claude-sidecar -v --port 9000  # verbose, custom port
 ```
 
+## Claude Code integration
+
+The sidecar is useless to an agent that doesn't know it exists. `./install.sh`
+wires it into Claude Code in three places, all idempotent — re-run it any time
+to refresh:
+
+| What | Where | Source of truth |
+|---|---|---|
+| Instructions telling Claude when to route through the sidecar | `~/.claude/CLAUDE.md` | `assets/claude-md-block.md` |
+| `PreToolUse` hook that intercepts blocked/long Bash calls and points Claude here | `~/.claude/hooks/` + `~/.claude/settings.json` | `assets/sidecar-redirect.py` |
+| Auto-start on shell login, plus `~/.local/bin` on `PATH` | your shell rc | — |
+
+**Both assets are canonical — edit them here, not in `~/.claude/`.** The
+installer replaces the existing CLAUDE.md block by matching its first heading
+(`# Sidecar — Running Blocked or Long Commands`), so edits made directly in
+`~/.claude/CLAUDE.md` are overwritten on the next `./install.sh`. Changing the
+API without updating `assets/claude-md-block.md` leaves every future session
+following stale instructions.
+
+Manual setup, if you'd rather not run the installer:
+
+```bash
+cargo build --release && cp target/release/claude-sidecar ~/.local/bin/
+cat assets/claude-md-block.md >> ~/.claude/CLAUDE.md
+```
+
+Then start it (`claude-sidecar &`) and confirm Claude can see it — ask it to
+run `curl -s http://localhost:8765/health`. The hook is optional; without it
+Claude follows the CLAUDE.md decision tree on its own, it just isn't nudged
+when the sandbox blocks something.
+
+Per-project instead of global? Put the block in a project's `./CLAUDE.md`
+rather than `~/.claude/CLAUDE.md` — same content, narrower scope.
+
 ## Configuration
 
 Every flag has an environment-variable equivalent.
@@ -83,6 +117,25 @@ The list lives in [`src/config.rs`](src/config.rs) (`ALLOWED_COMMANDS`) — edit
 to fit the tools you need. Per-request environment variables can be passed in the
 `env` field of `/exec` and `/jobs` requests.
 
+### Shell commands
+
+The POSIX shells (`bash`, `sh`, `zsh`) accept an inline command string, so you
+can run compound commands directly:
+
+```bash
+curl -s -X POST http://localhost:8765/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":"bash","args":["-c","git rev-parse HEAD && git status --short"]}'
+```
+
+Be aware of what this means: a `bash -c` string is interpreted by the shell and
+can invoke **any** binary on the machine, including commands not in
+`ALLOWED_COMMANDS`. The allowlist is therefore a convenience filter on the
+*named* command, not a hard security boundary — the same is already true of the
+allowlisted `python3`, `node`, `docker`, and `curl`. Inline execution flags are
+still blocked for the non-shell interpreters (`python3 -c`, `node -e`, …). Only
+run the sidecar on a machine you control.
+
 ## API
 
 All request bodies and responses are JSON. Errors are returned as
@@ -107,6 +160,39 @@ curl -s -X POST http://localhost:8765/exec \
   -d '{"cmd":"git","args":["status"],"cwd":"/path/to/repo"}'
 # {"stdout":"...","stderr":"...","exit_code":0}
 ```
+
+### `POST /batch` — run several commands in sequence
+
+Runs an ordered list of allowlisted commands one after another, so a chain like
+`git init && git add -A && git commit` is a single request instead of several.
+Each step is a `{cmd, args, cwd?, timeout_secs?, env?}` object; the top-level
+`cwd`, `timeout_secs` (per step, default 60), and `env` supply defaults a step
+can override.
+
+Every step is validated against the allowlist **before any step runs**, so a
+disallowed command anywhere in the list rejects the whole batch (`403`) without
+executing side effects. By default the batch stops at the first step that exits
+nonzero; set `continue_on_error: true` to run every step regardless. (A step that
+times out or fails to spawn aborts the batch with the matching error status even
+under `continue_on_error`.)
+
+```bash
+curl -s -X POST http://localhost:8765/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"cwd":"/path/to/repo","steps":[
+        {"cmd":"git","args":["init","-b","main"]},
+        {"cmd":"git","args":["add","-A"]},
+        {"cmd":"git","args":["commit","-m","Initial commit"]}
+      ]}'
+# {"steps":[{"cmd":"git","args":["init","-b","main"],"stdout":"...","stderr":"","exit_code":0}, ...],
+#  "failed_at":null,"success":true}
+```
+
+The response has `steps` (results for the steps that ran, in order — shorter than
+the request if it stopped early), `failed_at` (index of the first nonzero exit,
+or `null`), and `success` (true when every requested step ran and exited zero).
+Steps run in-process and buffer their output; for a single long-running build,
+use `/jobs` instead. Max 100 steps per batch.
 
 ### `POST /jobs` — start a long command
 
@@ -169,17 +255,45 @@ readable, which plain `curl` can't do.
 curl -s -X POST http://localhost:8765/browser/fetch \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://medium.com/some-paywalled-article"}'
-# {"url":"…","title":"…","content":"rendered page text"}
+# {"url":"…","title":"…","content":"# Heading\n\nArticle text…","truncated":false}
 ```
 
-Options: `wait_secs` (max page-load wait, default 20, cap 120), `format`
-(`"text"` = `innerText`, default; `"html"` = full DOM), `keep_tab` (leave the
-tab open, default false).
+Options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `format` | `"markdown"` | `"markdown"` = main content as markdown; `"text"` = whole-page `innerText`; `"html"` = full DOM |
+| `max_chars` | none | Cap the content; sets `truncated: true` when it bites |
+| `include_links` | `false` | Keep link/image targets in markdown (link text is always kept) |
+| `wait_secs` | `20` | Max page-load wait, cap 120 |
+| `keep_tab` | `false` | Leave the tab open (useful to see what actually rendered) |
+
+**On `markdown`.** The extractor drops site chrome — nav, cookie banners,
+related-article rails, comments — then serializes what's left, keeping
+headings, lists, tables, and fenced code with language tags. Publication date
+and author are re-attached as a one-line italic byline when they can be found,
+since dropping the masthead otherwise takes them with it, and "when was this
+published?" is a question worth ~40 characters. They come from `<head>`
+metadata (OpenGraph, Schema.org JSON-LD, citation tags), falling back to a
+byline-shaped element in the DOM. Measured against
+`innerText`: −10% on a Cloudflare blog post, −16% on MDN and the Rust book,
+−77% on a chrome-heavy landing page, and roughly break-even on a long Wikipedia
+article, where markdown's table scaffolding offsets what the strip pass removes.
+Structure is the bigger win; the size drop is a bonus, not a step change —
+`innerText` is already a decent extractor.
+
+Link targets are excluded by default because they cost more than they return:
+turning `include_links` on grows the MDN page from 13k to 21k characters, and a
+Wikipedia article by 40%. Turn it on when the agent needs to follow links.
+
+If the extractor picks the wrong block on some page, fall back to
+`"format":"text"`.
 
 ### `GET /browser/tab` — read the currently focused tab (macOS)
 
 Returns the page the user is looking at right now — navigate somewhere
-yourself, then have the agent read it. Takes `?format=text|html`.
+yourself, then have the agent read it. Takes the same `format`, `max_chars`,
+and `include_links` options as query parameters.
 
 ### Browser bridge setup (one-time)
 

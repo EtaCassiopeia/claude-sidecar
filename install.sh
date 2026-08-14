@@ -135,7 +135,7 @@ step "Patching ~/.claude/CLAUDE.md"
 
 # Patch using the canonical block stored in the repo
 python3 - "$CLAUDE_MD" "${REPO_DIR}/assets/claude-md-block.md" << 'PYEOF'
-import sys, re, pathlib
+import sys, pathlib
 target, block_path = sys.argv[1], sys.argv[2]
 new_block = pathlib.Path(block_path).read_text().strip()
 marker = new_block.split('\n')[0]  # first line is the heading
@@ -143,14 +143,29 @@ try:
     text = pathlib.Path(target).read_text()
 except FileNotFoundError:
     text = ""
-pattern = re.compile(r"(?m)^" + re.escape(marker) + r".*?(?=\n^# |\Z)", re.DOTALL | re.MULTILINE)
-if pattern.search(text):
-    pathlib.Path(target).write_text(pattern.sub(new_block, text, count=1))
-    print("  updated existing block")
-else:
+
+# Find top-level headings, ignoring fenced code — the block is full of bash
+# comments ("# 3. Final status") that look exactly like `# ` headings, and
+# treating one as a section boundary truncates the block mid-replacement and
+# leaves the remainder orphaned in the file.
+lines = text.split('\n')
+tops, fenced = [], False
+for i, line in enumerate(lines):
+    if line.lstrip().startswith('```'):
+        fenced = not fenced
+    elif not fenced and line.startswith('# '):
+        tops.append(i)
+
+start = next((i for i in tops if lines[i].rstrip() == marker), None)
+if start is None:
     with open(target, "a") as f:
-        f.write(("\n\n" if text else "") + new_block + "\n")
+        f.write(("\n\n" if text.strip() else "") + new_block + "\n")
     print("  appended new block")
+else:
+    end = next((i for i in tops if i > start), len(lines))
+    lines[start:end] = new_block.split('\n') + ['']
+    pathlib.Path(target).write_text('\n'.join(lines))
+    print("  updated existing block")
 PYEOF
 green "  $CLAUDE_MD patched"
 

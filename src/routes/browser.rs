@@ -72,20 +72,34 @@ end run"#;
 const EXTRACT_TEXT_JS: &str =
     "JSON.stringify({url:location.href,title:document.title,content:document.body.innerText})";
 const EXTRACT_HTML_JS: &str = "JSON.stringify({url:location.href,title:document.title,content:document.documentElement.outerHTML})";
+/// The extractor exports `(keepLinks) => json`; these are its only two call
+/// sites. `concat!` builds them at compile time, so both remain fixed script
+/// text — a request can select between them but can never contribute to them.
+const EXTRACT_MARKDOWN_JS: &str = concat!("(", include_str!("extract_markdown.js"), ")(false)");
+const EXTRACT_MARKDOWN_LINKS_JS: &str =
+    concat!("(", include_str!("extract_markdown.js"), ")(true)");
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
-    /// Rendered text (`document.body.innerText`) — what a reader sees.
+    /// Main content only, as markdown. The default because it is the cheapest
+    /// faithful rendering: site chrome is dropped and structure survives.
     #[default]
+    Markdown,
+    /// Rendered text of the whole page (`document.body.innerText`) — the escape
+    /// hatch for when the extractor picks the wrong block.
     Text,
     /// Full DOM (`document.documentElement.outerHTML`).
     Html,
 }
 
 impl Format {
-    fn extract_js(self) -> &'static str {
+    /// `include_links` only reaches the markdown extractor; the text and HTML
+    /// scripts have no notion of it.
+    fn extract_js(self, include_links: bool) -> &'static str {
         match self {
+            Format::Markdown if include_links => EXTRACT_MARKDOWN_LINKS_JS,
+            Format::Markdown => EXTRACT_MARKDOWN_JS,
             Format::Text => EXTRACT_TEXT_JS,
             Format::Html => EXTRACT_HTML_JS,
         }
@@ -103,21 +117,48 @@ pub struct FetchRequest {
     /// actually rendered).
     #[serde(default)]
     pub keep_tab: bool,
+    /// Cap the returned content at this many characters.
+    pub max_chars: Option<usize>,
+    /// Keep link and image targets in markdown output. Off by default because
+    /// URLs are a large share of the bytes and are rarely what the caller came
+    /// for; link text is always kept either way.
+    #[serde(default)]
+    pub include_links: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TabQuery {
     #[serde(default)]
     pub format: Format,
+    pub max_chars: Option<usize>,
+    #[serde(default)]
+    pub include_links: bool,
 }
 
 /// Extracted page. Doubles as the JSON shape produced by the in-page
-/// JavaScript, so deserializing the script output yields the response directly.
+/// JavaScript, so deserializing the script output yields the response directly
+/// — `truncated` is the one field the caller-side sets, hence its default.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Page {
     pub url: String,
     pub title: String,
     pub content: String,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl Page {
+    /// Cut `content` to `max_chars` characters, flagging the response so a
+    /// short page and a clipped one are never confused.
+    fn truncate(mut self, max_chars: Option<usize>) -> Self {
+        let Some(max) = max_chars else { return self };
+        if self.content.chars().count() <= max {
+            return self;
+        }
+        self.content = self.content.chars().take(max).collect();
+        self.truncated = true;
+        self
+    }
 }
 
 /// `POST /browser/fetch` — open a URL in the user's Chrome and return the
@@ -142,7 +183,12 @@ pub async fn fetch(Json(req): Json<FetchRequest>) -> Result<JsonResponse<Page>, 
     let started = Instant::now();
     let result = run_script(
         FETCH_SCRIPT,
-        &[&req.url, &ticks, req.format.extract_js(), keep_tab],
+        &[
+            &req.url,
+            &ticks,
+            req.format.extract_js(req.include_links),
+            keep_tab,
+        ],
         wait_secs + SCRIPT_MARGIN_SECS,
     )
     .await;
@@ -151,7 +197,7 @@ pub async fn fetch(Json(req): Json<FetchRequest>) -> Result<JsonResponse<Page>, 
         Some(if result.is_ok() { 0 } else { 1 }),
         started.elapsed().as_millis(),
     );
-    result.map(JsonResponse)
+    result.map(|page| JsonResponse(page.truncate(req.max_chars)))
 }
 
 /// `GET /browser/tab` — return the page currently focused in Chrome. Lets the
@@ -159,13 +205,18 @@ pub async fn fetch(Json(req): Json<FetchRequest>) -> Result<JsonResponse<Page>, 
 pub async fn tab(Query(q): Query<TabQuery>) -> Result<JsonResponse<Page>, SidecarError> {
     logger::log_request("GET", "/browser/tab", "chrome", &[], None);
     let started = Instant::now();
-    let result = run_script(TAB_SCRIPT, &[q.format.extract_js()], TAB_TIMEOUT_SECS).await;
+    let result = run_script(
+        TAB_SCRIPT,
+        &[q.format.extract_js(q.include_links)],
+        TAB_TIMEOUT_SECS,
+    )
+    .await;
     logger::log_completion(
         "/browser/tab",
         Some(if result.is_ok() { 0 } else { 1 }),
         started.elapsed().as_millis(),
     );
-    result.map(JsonResponse)
+    result.map(|page| JsonResponse(page.truncate(q.max_chars)))
 }
 
 async fn run_script(script: &str, args: &[&str], timeout_secs: u64) -> Result<Page, SidecarError> {
@@ -274,8 +325,83 @@ mod tests {
     fn fetch_request_defaults() {
         let req: FetchRequest = serde_json::from_str(r#"{"url":"https://x.com"}"#)
             .expect("minimal request deserializes");
-        assert!(matches!(req.format, Format::Text));
+        assert!(matches!(req.format, Format::Markdown));
         assert!(!req.keep_tab);
         assert!(req.wait_secs.is_none());
+        assert!(req.max_chars.is_none());
+        assert!(!req.include_links);
+    }
+
+    #[test]
+    fn every_format_maps_to_a_script_returning_the_page_shape() {
+        for format in [Format::Markdown, Format::Text, Format::Html] {
+            for links in [false, true] {
+                let js = format.extract_js(links);
+                assert!(js.contains("JSON.stringify"), "{format:?} must emit JSON");
+                for field in ["url", "title", "content"] {
+                    assert!(js.contains(field), "{format:?} must emit {field}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn include_links_selects_a_different_markdown_script() {
+        assert_ne!(
+            Format::Markdown.extract_js(false),
+            Format::Markdown.extract_js(true)
+        );
+        assert!(Format::Markdown.extract_js(true).ends_with(")(true)"));
+        assert!(Format::Markdown.extract_js(false).ends_with(")(false)"));
+    }
+
+    #[test]
+    fn include_links_does_not_affect_text_or_html() {
+        for format in [Format::Text, Format::Html] {
+            assert_eq!(format.extract_js(false), format.extract_js(true));
+        }
+    }
+
+    fn page(content: &str) -> Page {
+        Page {
+            url: "https://x.com/".into(),
+            title: "T".into(),
+            content: content.into(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn truncate_clips_and_flags_only_when_over_the_cap() {
+        let clipped = page("hello world").truncate(Some(5));
+        assert_eq!(clipped.content, "hello");
+        assert!(clipped.truncated);
+
+        let untouched = page("hello").truncate(Some(5));
+        assert_eq!(untouched.content, "hello");
+        assert!(!untouched.truncated);
+    }
+
+    #[test]
+    fn truncate_is_a_no_op_without_a_cap() {
+        let kept = page("hello world").truncate(None);
+        assert_eq!(kept.content, "hello world");
+        assert!(!kept.truncated);
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // Slicing by byte offset here would panic mid-codepoint.
+        let clipped = page("héllo→wörld").truncate(Some(6));
+        assert_eq!(clipped.content, "héllo→");
+        assert!(clipped.truncated);
+    }
+
+    #[test]
+    fn page_parses_without_the_truncated_flag() {
+        // The in-page script never emits it; it is set on the Rust side.
+        let page = parse_page(r#"{"url":"https://x.com/","title":"T","content":"body"}"#)
+            .expect("script output deserializes");
+        assert!(!page.truncated);
     }
 }

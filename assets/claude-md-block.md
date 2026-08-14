@@ -11,7 +11,10 @@ manually** — route it through the local `claude-sidecar` instead.
 2. **Is it any other allowlisted command** (`gh`, `git`, `go`, `npm`, `python3`,
    `curl`, `grep`, `find`, `jq`, `security`, …)? → POST `http://localhost:8765/exec` — buffered JSON response, 60s
    timeout.
-3. **Is the sidecar not running?** → start it with `claude-sidecar &`.
+3. **Is it a web page WebFetch can't read** (paywall, login wall, Cloudflare
+   block) that the user's own browser can? → POST
+   `http://localhost:8765/browser/fetch` (browser bridge — see below).
+4. **Is the sidecar not running?** → start it with `claude-sidecar &`.
 
 Allowed: gh, git, go, sbt, cargo, mvn, gradle, npm, node, python3, pytest, curl, docker, docker-compose, grep, rg, find, ls, cat, head, tail, wc, diff, sed, awk, sort, uniq, cut, tr, xargs, cp, mv, rm, mkdir, touch, chmod, jq, yq, which, env, printenv, echo, printf, date, uname, security
 
@@ -54,6 +57,36 @@ done
 # 3. Final status
 curl -s "http://localhost:8765/jobs/$JOB/status"
 ```
+
+## Browser bridge — pages behind paywalls/logins (macOS)
+
+Fetches a page through the user's real Chrome (real profile + cookies) via
+AppleScript. Use when WebFetch returns truncated/paywalled content the user
+says their browser can see.
+
+```bash
+# Open URL in a new Chrome tab, wait for load, return the main content as
+# markdown (site chrome stripped), close tab
+curl -s -X POST http://localhost:8765/browser/fetch \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://medium.com/some-article","max_chars":40000}'
+# → {"url":"…","title":"…","content":"# Heading\n\n…","truncated":false}
+
+# Read whatever tab the user currently has focused ("read this page")
+curl -s 'http://localhost:8765/browser/tab?max_chars=40000'
+```
+
+Options (both endpoints; `/browser/tab` takes them as query params):
+`format` (`"markdown"` default — main content only; `"text"` = whole-page
+innerText; `"html"` = full DOM), `max_chars` (cap content, sets
+`truncated:true`), `include_links` (default false — link *text* is always
+kept, only the URLs are dropped; turn on when you need to follow links),
+`wait_secs` (default 20, cap 120), `keep_tab` (bool). Only `http(s)` URLs.
+If markdown extraction picks the wrong block on some page, retry with
+`"format":"text"`.
+If it errors mentioning "Allow JavaScript from Apple Events" or Automation
+permission, relay the fix from the error message to the user — both are
+one-time manual Chrome/macOS settings.
 
 ## Health check
 
