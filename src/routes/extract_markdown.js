@@ -245,6 +245,104 @@
     }
   };
 
+  // --- byline ----------------------------------------------------------------
+  //
+  // The strip pass drops the masthead, and on sites that do not wrap the
+  // article in <article> the publication date and author go with it. Both are
+  // usually declared in <head> anyway, which the clone never touches, so
+  // recover them there and re-attach as one line — cheaper and more reliable
+  // than trying to keep the right <header> in the body.
+
+  const firstMeta = (selectors) => {
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        const raw = el.getAttribute("content") || el.getAttribute("datetime") || "";
+        if (raw.trim()) return raw.trim();
+      }
+    }
+    return "";
+  };
+
+  // Schema.org data is often the only place a date survives. Walk it for the
+  // requested key, bounded so a pathological blob cannot hang the extraction.
+  const fromJsonLd = (key) => {
+    const name = (value) => {
+      if (typeof value === "string") return value;
+      if (Array.isArray(value)) return value.length ? name(value[0]) : "";
+      if (value && typeof value.name === "string") return value.name;
+      return "";
+    };
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+      let parsed;
+      try {
+        parsed = JSON.parse(script.textContent);
+      } catch {
+        continue; // a malformed blob is not a reason to lose the whole byline
+      }
+      const stack = [parsed];
+      for (let seen = 0; stack.length && seen < 500; seen++) {
+        const node = stack.pop();
+        if (Array.isArray(node)) {
+          stack.push(...node);
+        } else if (node && typeof node === "object") {
+          const hit = name(node[key]).trim();
+          if (hit) return hit;
+          stack.push(...Object.values(node));
+        }
+      }
+    }
+    return "";
+  };
+
+  const published = (
+    firstMeta([
+      'meta[property="article:published_time"]',
+      'meta[name="article:published_time"]',
+      'meta[itemprop="datePublished"]',
+      'meta[name="datePublished"]',
+      'meta[name="citation_publication_date"]',
+      'meta[name="pubdate"]',
+      'meta[name="date"]',
+      "article time[datetime]",
+      "time[datetime]",
+    ]) || fromJsonLd("datePublished")
+  ).trim();
+
+  const author = (
+    firstMeta([
+      'meta[name="author"]',
+      'meta[property="article:author"]',
+      'meta[name="citation_author"]',
+      'meta[property="og:article:author"]',
+    ]) || fromJsonLd("author")
+  ).trim();
+
+  // Plenty of sites declare no metadata at all and put the byline in a plain
+  // div beside the prose — a sibling of the container the scorer picks, so it
+  // is lost without ever passing through the strip pass. Look for one, but
+  // demand it read like a byline: a year or a leading "By", and short. That
+  // rules out the menus and promo blocks a bare class match would drag in.
+  const domByline = () => {
+    const MARKS =
+      /(^|[\s_-])(byline|dateline|publish|published|post-?date|post-?meta|author|posted)([\s_-]|$)/i;
+    for (const el of document.querySelectorAll("[class],[id]")) {
+      if (!MARKS.test(`${el.getAttribute("class") || ""} ${el.id || ""}`)) continue;
+      if (el.closest("nav,footer,aside")) continue;
+      const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (text.length <= 120 && (/\b(19|20)\d{2}\b/.test(text) || /^by\s/i.test(text))) {
+        return text;
+      }
+    }
+    return "";
+  };
+
+  // `article:author` is frequently a profile URL rather than a name, and some
+  // sites stuff a whole sentence into `author` — neither is worth the tokens.
+  const usableAuthor = author && author.length <= 80 && !/^https?:/.test(author) ? author : "";
+  // Prefer the date alone: "2024-09-05T00:00:00Z" says nothing "2024-09-05" does not.
+  const isoDay = /^(\d{4}-\d{2}-\d{2})/.exec(published);
+  const usableDate = isoDay ? isoDay[1] : published.length <= 30 ? published : "";
+
   // --- entry point -----------------------------------------------------------
 
   const body = document.body ? document.body.cloneNode(true) : null;
@@ -255,5 +353,23 @@
         .trim()
     : "";
 
-  return JSON.stringify({ url: location.href, title: document.title, content });
+  // Skip the byline when the extractor already kept one, so pages that do use
+  // <article> are not annotated twice.
+  const opening = content.slice(0, 300);
+  const parts = [];
+  if (usableDate && !opening.includes(usableDate)) parts.push(usableDate);
+  if (usableAuthor && !opening.includes(usableAuthor)) parts.push(usableAuthor);
+
+  let bylineText = parts.join(" · ");
+  if (!usableDate && !usableAuthor) {
+    const found = domByline();
+    if (found && !opening.includes(found)) bylineText = found;
+  }
+  const byline = bylineText && content ? `*${bylineText}*\n\n` : "";
+
+  return JSON.stringify({
+    url: location.href,
+    title: document.title,
+    content: byline + content,
+  });
 })

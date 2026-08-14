@@ -218,7 +218,12 @@ Options:
 
 **On `markdown`.** The extractor drops site chrome — nav, cookie banners,
 related-article rails, comments — then serializes what's left, keeping
-headings, lists, tables, and fenced code with language tags. Measured against
+headings, lists, tables, and fenced code with language tags. Publication date
+and author are re-attached as a one-line italic byline when they can be found,
+since dropping the masthead otherwise takes them with it, and "when was this
+published?" is a question worth ~40 characters. They come from `<head>`
+metadata (OpenGraph, Schema.org JSON-LD, citation tags), falling back to a
+byline-shaped element in the DOM. Measured against
 `innerText`: −10% on a Cloudflare blog post, −16% on MDN and the Rust book,
 −77% on a chrome-heavy landing page, and roughly break-even on a long Wikipedia
 article, where markdown's table scaffolding offsets what the strip pass removes.
