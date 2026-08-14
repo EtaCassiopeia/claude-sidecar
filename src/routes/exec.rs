@@ -31,35 +31,49 @@ pub struct ExecResponse {
     pub exit_code: i32,
 }
 
-/// `POST /exec` — run a short, allowlisted command and return its buffered
-/// output. For long-running work use `POST /jobs` instead.
-pub async fn handle(
-    State(state): State<AppState>,
-    Json(req): Json<ExecRequest>,
-) -> Result<Json<ExecResponse>, SidecarError> {
-    if !config::is_allowed(&req.cmd) {
-        return Err(SidecarError::NotAllowed(req.cmd));
+/// Everything needed to run one allowlisted command. Borrowed so both `/exec`
+/// and `/batch` can build a spec from their own request shapes without cloning.
+pub(crate) struct RunSpec<'a> {
+    pub cmd: &'a str,
+    pub args: &'a [String],
+    pub cwd: Option<&'a str>,
+    pub env: &'a [(String, String)],
+    pub timeout_secs: u64,
+    pub verbose: bool,
+}
+
+/// Validate a command against the allowlist and its argument rules.
+///
+/// Separated from execution so a multi-step caller (`/batch`) can reject an
+/// entire request up front — before running any side-effecting step — if any
+/// command is disallowed.
+pub(crate) fn validate(cmd: &str, args: &[String]) -> Result<(), SidecarError> {
+    if !config::is_allowed(cmd) {
+        return Err(SidecarError::NotAllowed(cmd.to_string()));
     }
-    if let Err(reason) = config::check_args(&req.cmd, &req.args) {
+    if let Err(reason) = config::check_args(cmd, args) {
         return Err(SidecarError::NotAllowed(reason));
     }
-    let resolved =
-        config::resolve(&req.cmd).ok_or_else(|| SidecarError::CommandNotFound(req.cmd.clone()))?;
+    Ok(())
+}
 
-    let timeout_secs = req.timeout_secs.unwrap_or(60);
-    logger::log_request("POST", "/exec", &req.cmd, &req.args, req.cwd.as_deref());
-    let started = Instant::now();
+/// Run one allowlisted command to completion (or timeout) and return its
+/// buffered output. Validates first, so it is safe to call directly.
+pub(crate) async fn run_command(spec: RunSpec<'_>) -> Result<ExecResponse, SidecarError> {
+    validate(spec.cmd, spec.args)?;
+    let resolved =
+        config::resolve(spec.cmd).ok_or_else(|| SidecarError::CommandNotFound(spec.cmd.into()))?;
 
     let mut cmd = Command::new(&resolved);
-    cmd.args(&req.args)
+    cmd.args(spec.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // If we drop the child on timeout, make sure the OS process dies too.
         .kill_on_drop(true);
-    if let Some(dir) = &req.cwd {
+    if let Some(dir) = spec.cwd {
         cmd.current_dir(dir);
     }
-    for (key, val) in &req.env {
+    for (key, val) in spec.env {
         cmd.env(key, val);
     }
 
@@ -73,10 +87,9 @@ pub async fn handle(
         .take()
         .ok_or_else(|| SidecarError::Internal("stderr pipe missing".into()))?;
 
-    let verbose = state.config.verbose;
     // Drain both streams concurrently so a full pipe buffer can't deadlock us.
-    let stdout_task = tokio::spawn(collect(stdout, verbose));
-    let stderr_task = tokio::spawn(collect(stderr, verbose));
+    let stdout_task = tokio::spawn(collect(stdout, spec.verbose));
+    let stderr_task = tokio::spawn(collect(stderr, spec.verbose));
 
     let wait = async {
         let stdout = stdout_task.await.unwrap_or_default();
@@ -85,24 +98,47 @@ pub async fn handle(
         Ok::<_, std::io::Error>((stdout, stderr, status))
     };
 
-    match timeout(Duration::from_secs(timeout_secs), wait).await {
-        Ok(Ok((stdout, stderr, status))) => {
-            let exit_code = status.code().unwrap_or(-1);
-            logger::log_completion("/exec", Some(exit_code), started.elapsed().as_millis());
-            Ok(Json(ExecResponse {
-                stdout,
-                stderr,
-                exit_code,
-            }))
-        }
+    match timeout(Duration::from_secs(spec.timeout_secs), wait).await {
+        Ok(Ok((stdout, stderr, status))) => Ok(ExecResponse {
+            stdout,
+            stderr,
+            exit_code: status.code().unwrap_or(-1),
+        }),
         Ok(Err(e)) => Err(SidecarError::Io(e)),
-        Err(_) => {
-            // `wait` (and with it `child`) is dropped here; `kill_on_drop` reaps
-            // the process.
-            logger::log_completion("/exec", None, started.elapsed().as_millis());
-            Err(SidecarError::Timeout { secs: timeout_secs })
-        }
+        // `wait` (and with it `child`) is dropped here; `kill_on_drop` reaps it.
+        Err(_) => Err(SidecarError::Timeout {
+            secs: spec.timeout_secs,
+        }),
     }
+}
+
+/// `POST /exec` — run a short, allowlisted command and return its buffered
+/// output. For long-running work use `POST /jobs` instead.
+pub async fn handle(
+    State(state): State<AppState>,
+    Json(req): Json<ExecRequest>,
+) -> Result<Json<ExecResponse>, SidecarError> {
+    let timeout_secs = req.timeout_secs.unwrap_or(60);
+    logger::log_request("POST", "/exec", &req.cmd, &req.args, req.cwd.as_deref());
+    let started = Instant::now();
+
+    let result = run_command(RunSpec {
+        cmd: &req.cmd,
+        args: &req.args,
+        cwd: req.cwd.as_deref(),
+        env: &req.env,
+        timeout_secs,
+        verbose: state.config.verbose,
+    })
+    .await;
+
+    match &result {
+        Ok(resp) => {
+            logger::log_completion("/exec", Some(resp.exit_code), started.elapsed().as_millis())
+        }
+        Err(_) => logger::log_completion("/exec", None, started.elapsed().as_millis()),
+    }
+    result.map(Json)
 }
 
 /// Read a stream to end-of-file, returning its full text and optionally echoing

@@ -39,13 +39,13 @@ pub fn print_banner(port: u16) {
         );
         eprintln!();
         eprintln!(
-            "  {DIM}Endpoints:{RESET}  POST /exec  POST /jobs  GET /jobs/{{id}}/lines  POST /browser/fetch  GET /browser/tab  GET /health{RESET}"
+            "  {DIM}Endpoints:{RESET}  POST /exec  POST /batch  POST /jobs  GET /jobs/{{id}}/lines  POST /browser/fetch  GET /browser/tab  GET /health{RESET}"
         );
         eprintln!("  {DIM}Allowed:{RESET}   {allowed}{RESET}");
     } else {
         eprintln!(
             "claude-sidecar v3 | port:{port}\n\
-             Endpoints: POST /exec  POST /jobs  GET /jobs/{{id}}/lines  POST /browser/fetch  GET /browser/tab  GET /health\n\
+             Endpoints: POST /exec  POST /batch  POST /jobs  GET /jobs/{{id}}/lines  POST /browser/fetch  GET /browser/tab  GET /health\n\
              Allowed: {allowed}"
         );
     }

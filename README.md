@@ -117,6 +117,25 @@ The list lives in [`src/config.rs`](src/config.rs) (`ALLOWED_COMMANDS`) — edit
 to fit the tools you need. Per-request environment variables can be passed in the
 `env` field of `/exec` and `/jobs` requests.
 
+### Shell commands
+
+The POSIX shells (`bash`, `sh`, `zsh`) accept an inline command string, so you
+can run compound commands directly:
+
+```bash
+curl -s -X POST http://localhost:8765/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":"bash","args":["-c","git rev-parse HEAD && git status --short"]}'
+```
+
+Be aware of what this means: a `bash -c` string is interpreted by the shell and
+can invoke **any** binary on the machine, including commands not in
+`ALLOWED_COMMANDS`. The allowlist is therefore a convenience filter on the
+*named* command, not a hard security boundary — the same is already true of the
+allowlisted `python3`, `node`, `docker`, and `curl`. Inline execution flags are
+still blocked for the non-shell interpreters (`python3 -c`, `node -e`, …). Only
+run the sidecar on a machine you control.
+
 ## API
 
 All request bodies and responses are JSON. Errors are returned as
@@ -141,6 +160,39 @@ curl -s -X POST http://localhost:8765/exec \
   -d '{"cmd":"git","args":["status"],"cwd":"/path/to/repo"}'
 # {"stdout":"...","stderr":"...","exit_code":0}
 ```
+
+### `POST /batch` — run several commands in sequence
+
+Runs an ordered list of allowlisted commands one after another, so a chain like
+`git init && git add -A && git commit` is a single request instead of several.
+Each step is a `{cmd, args, cwd?, timeout_secs?, env?}` object; the top-level
+`cwd`, `timeout_secs` (per step, default 60), and `env` supply defaults a step
+can override.
+
+Every step is validated against the allowlist **before any step runs**, so a
+disallowed command anywhere in the list rejects the whole batch (`403`) without
+executing side effects. By default the batch stops at the first step that exits
+nonzero; set `continue_on_error: true` to run every step regardless. (A step that
+times out or fails to spawn aborts the batch with the matching error status even
+under `continue_on_error`.)
+
+```bash
+curl -s -X POST http://localhost:8765/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"cwd":"/path/to/repo","steps":[
+        {"cmd":"git","args":["init","-b","main"]},
+        {"cmd":"git","args":["add","-A"]},
+        {"cmd":"git","args":["commit","-m","Initial commit"]}
+      ]}'
+# {"steps":[{"cmd":"git","args":["init","-b","main"],"stdout":"...","stderr":"","exit_code":0}, ...],
+#  "failed_at":null,"success":true}
+```
+
+The response has `steps` (results for the steps that ran, in order — shorter than
+the request if it stopped early), `failed_at` (index of the first nonzero exit,
+or `null`), and `success` (true when every requested step ran and exited zero).
+Steps run in-process and buffer their output; for a single long-running build,
+use `/jobs` instead. Max 100 steps per batch.
 
 ### `POST /jobs` — start a long command
 

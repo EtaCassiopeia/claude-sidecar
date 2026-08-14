@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod browser;
 pub mod exec;
 pub mod health;
@@ -16,6 +17,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::handle))
         .route("/exec", post(exec::handle))
+        .route("/batch", post(batch::handle))
         .route("/jobs", get(jobs::list).post(jobs::create))
         .route("/jobs/:id/lines", get(jobs::lines))
         .route("/jobs/:id/status", get(jobs::status))
@@ -56,6 +58,20 @@ mod tests {
             .await
             .expect("router is infallible")
             .status()
+    }
+
+    /// Send a request and return both the status and the parsed JSON body.
+    async fn send_json(req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = router(test_state())
+            .oneshot(req)
+            .await
+            .expect("router is infallible");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
     }
 
     fn json_post(uri: &str, body: &str) -> Request<Body> {
@@ -120,5 +136,83 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(send(req).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn batch_empty_steps_is_400() {
+        let req = json_post("/batch", r#"{"steps":[]}"#);
+        assert_eq!(send(req).await, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_disallowed_command_rejects_whole_batch() {
+        // `sudo` in step 2 must reject the batch up front (403) — the allowlisted
+        // `echo` in step 1 must not run first.
+        let req = json_post(
+            "/batch",
+            r#"{"steps":[{"cmd":"echo","args":["hi"]},{"cmd":"sudo","args":["-n","true"]}]}"#,
+        );
+        assert_eq!(send(req).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn batch_interpreter_inline_exec_is_403() {
+        let req = json_post(
+            "/batch",
+            r#"{"steps":[{"cmd":"python3","args":["-c","import os"]}]}"#,
+        );
+        assert_eq!(send(req).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn batch_happy_path_runs_all_steps() {
+        let req = json_post(
+            "/batch",
+            r#"{"steps":[{"cmd":"echo","args":["a"]},{"cmd":"echo","args":["b"]}]}"#,
+        );
+        let (status, body) = send_json(req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], true);
+        assert!(body["failed_at"].is_null());
+        assert_eq!(body["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(body["steps"][0]["stdout"], "a\n");
+    }
+
+    #[tokio::test]
+    async fn batch_stops_at_first_failure() {
+        // `ls` of a missing path exits nonzero; the third step must be skipped.
+        let req = json_post(
+            "/batch",
+            r#"{"steps":[
+                {"cmd":"echo","args":["one"]},
+                {"cmd":"ls","args":["/definitely/does/not/exist/xyz"]},
+                {"cmd":"echo","args":["three"]}
+            ]}"#,
+        );
+        let (status, body) = send_json(req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["failed_at"], 1);
+        // Only the first two steps ran; the third was skipped.
+        assert_eq!(body["steps"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_continue_on_error_runs_every_step() {
+        let req = json_post(
+            "/batch",
+            r#"{"continue_on_error":true,"steps":[
+                {"cmd":"echo","args":["one"]},
+                {"cmd":"ls","args":["/definitely/does/not/exist/xyz"]},
+                {"cmd":"echo","args":["three"]}
+            ]}"#,
+        );
+        let (status, body) = send_json(req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["failed_at"], 1);
+        // All three ran despite the middle failure.
+        assert_eq!(body["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(body["steps"][2]["stdout"], "three\n");
     }
 }
