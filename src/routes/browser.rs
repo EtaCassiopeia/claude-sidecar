@@ -2,6 +2,10 @@
 //! session via AppleScript, so pages behind a login or paywall the user already
 //! has access to are readable from the sandbox.
 //!
+//! YouTube watch pages are a special case handled by a second extractor: what a
+//! reader wants from a video is what is said in it, and that is not in the DOM.
+//! See `extract_youtube.js`.
+//!
 //! Unlike `/exec`, nothing here is caller-controlled beyond the target URL: the
 //! AppleScript and the JavaScript executed in the page are fixed templates, and
 //! the URL travels as an osascript argv item — it is never spliced into script
@@ -33,15 +37,22 @@ const SCRIPT_MARGIN_SECS: u64 = 15;
 /// `/browser/tab` reads an already-loaded tab, so it only needs the margin.
 const TAB_TIMEOUT_SECS: u64 = SCRIPT_MARGIN_SECS;
 
+/// Ticks (of 0.5s) the prepare step may spend before extraction runs anyway.
+/// Only a YouTube watch page ever uses them; everything else answers `"ready"`
+/// on the first call.
+const PREPARE_TICKS: u32 = 20;
+
 /// Open the URL in a new tab of the front window, wait for it to finish
-/// loading (bounded by the tick budget), extract the page, and close the tab
-/// unless asked to keep it. Extraction runs even if the tick budget runs out —
-/// partial content beats none.
+/// loading (bounded by the tick budget), give the prepare step its own bounded
+/// run, extract the page, and close the tab unless asked to keep it.
+/// Extraction runs even if either budget runs out — partial content beats none.
 const FETCH_SCRIPT: &str = r#"on run argv
     set theUrl to item 1 of argv
     set ticksLeft to (item 2 of argv) as integer
-    set extractJs to item 3 of argv
-    set keepTab to item 4 of argv
+    set prepareJs to item 3 of argv
+    set extractJs to item 4 of argv
+    set keepTab to item 5 of argv
+    set prepareTicks to (item 6 of argv) as integer
     tell application "Google Chrome"
         if (count of windows) = 0 then make new window
         tell front window to set theTab to make new tab with properties {URL:theUrl}
@@ -51,6 +62,11 @@ const FETCH_SCRIPT: &str = r#"on run argv
         end repeat
         delay 0.5
         try
+            repeat while prepareTicks > 0
+                if (execute theTab javascript prepareJs) is "ready" then exit repeat
+                delay 0.5
+                set prepareTicks to prepareTicks - 1
+            end repeat
             set payload to execute theTab javascript extractJs
         on error errMsg number errNum
             if keepTab is "0" then close theTab
@@ -69,25 +85,79 @@ const TAB_SCRIPT: &str = r#"on run argv
     end tell
 end run"#;
 
+/// Driven in a loop by `FETCH_SCRIPT` until it answers `"ready"`. YouTube
+/// renders a video's transcript only once the viewer asks for it, and Chrome's
+/// `execute javascript` returns synchronously and cannot await, so the waiting
+/// has to live in AppleScript — which in turn means this step is called
+/// repeatedly and must be idempotent. Clicking the button a second time would
+/// close the panel again, hence the two checks before the click.
+///
+/// Anything that is not a YouTube watch page — overwhelmingly the common case —
+/// answers on the first call, so this costs other fetches a single round trip.
+const OPEN_TRANSCRIPT_JS: &str = r##"(() => {
+  if (!/(^|\.)youtube\.com$/.test(location.hostname)) return "ready";
+  const watch =
+    new URLSearchParams(location.search).get("v") || /^\/shorts\//.test(location.pathname);
+  if (!watch) return "ready";
+  if (document.querySelector("ytd-transcript-segment-renderer")) return "ready";
+  // No caption track in the page's own player data means no transcript button
+  // will ever appear, and waiting for one would just burn the budget.
+  const captioned = [...document.querySelectorAll("script")].some((s) =>
+    (s.textContent || "").includes("\"captionTracks\""));
+  if (!captioned) return "ready";
+  // The panel is open but still filling in; waiting is all that is left.
+  if (document.querySelector("ytd-transcript-renderer")) return "wait";
+  document.querySelector("#description-inline-expander #expand")?.click();
+  const button = [...document.querySelectorAll("button, tp-yt-paper-button")].find((el) =>
+    `${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`
+      .toLowerCase()
+      .includes("transcript"));
+  if (button) button.click();
+  return "wait";
+})()"##;
+
+/// The prepare step for formats that want the page exactly as it stands.
+const ALREADY_READY_JS: &str = r#""ready""#;
+
 const EXTRACT_TEXT_JS: &str =
     "JSON.stringify({url:location.href,title:document.title,content:document.body.innerText})";
 const EXTRACT_HTML_JS: &str = "JSON.stringify({url:location.href,title:document.title,content:document.documentElement.outerHTML})";
-/// The extractor exports `(keepLinks) => json`; these are its only two call
-/// sites. `concat!` builds them at compile time, so both remain fixed script
-/// text — a request can select between them but can never contribute to them.
-const EXTRACT_MARKDOWN_JS: &str = concat!("(", include_str!("extract_markdown.js"), ")(false)");
-const EXTRACT_MARKDOWN_LINKS_JS: &str =
-    concat!("(", include_str!("extract_markdown.js"), ")(true)");
+/// The article extractor exports `(keepLinks) => json` and the YouTube
+/// extractor `() => json | null`; these are their only call sites. `concat!`
+/// builds them at compile time, so each remains fixed script text — a request
+/// can select between them but can never contribute to them.
+///
+/// The YouTube extractor is chained in front because a watch page defeats the
+/// article extractor entirely: what a reader wants is the spoken word, which is
+/// not in the DOM. It returns `null` on anything that is not a watch page, so
+/// `||` hands the page straight to the article path in every other case.
+const EXTRACT_MARKDOWN_JS: &str = concat!(
+    "(",
+    include_str!("extract_youtube.js"),
+    ")() || (",
+    include_str!("extract_markdown.js"),
+    ")(false)"
+);
+const EXTRACT_MARKDOWN_LINKS_JS: &str = concat!(
+    "(",
+    include_str!("extract_youtube.js"),
+    ")() || (",
+    include_str!("extract_markdown.js"),
+    ")(true)"
+);
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     /// Main content only, as markdown. The default because it is the cheapest
-    /// faithful rendering: site chrome is dropped and structure survives.
+    /// faithful rendering: site chrome is dropped and structure survives. On a
+    /// YouTube watch page this yields the video's transcript, metadata, and
+    /// related-video links instead of the DOM.
     #[default]
     Markdown,
     /// Rendered text of the whole page (`document.body.innerText`) — the escape
-    /// hatch for when the extractor picks the wrong block.
+    /// hatch for when the extractor picks the wrong block, and the way to read
+    /// a YouTube watch page as a page rather than as a transcript.
     Text,
     /// Full DOM (`document.documentElement.outerHTML`).
     Html,
@@ -102,6 +172,17 @@ impl Format {
             Format::Markdown => EXTRACT_MARKDOWN_JS,
             Format::Text => EXTRACT_TEXT_JS,
             Format::Html => EXTRACT_HTML_JS,
+        }
+    }
+
+    /// Run repeatedly before extraction until it answers `"ready"`. Only the
+    /// markdown path asks the page for anything: it is what opens a YouTube
+    /// transcript panel, while `text` and `html` are documented as reading the
+    /// page exactly as it stands.
+    fn prepare_js(self) -> &'static str {
+        match self {
+            Format::Markdown => OPEN_TRANSCRIPT_JS,
+            Format::Text | Format::Html => ALREADY_READY_JS,
         }
     }
 }
@@ -181,15 +262,21 @@ pub async fn fetch(Json(req): Json<FetchRequest>) -> Result<JsonResponse<Page>, 
         None,
     );
     let started = Instant::now();
+    let prepare_ticks = PREPARE_TICKS.to_string();
     let result = run_script(
         FETCH_SCRIPT,
         &[
             &req.url,
             &ticks,
+            req.format.prepare_js(),
             req.format.extract_js(req.include_links),
             keep_tab,
+            &prepare_ticks,
         ],
-        wait_secs + SCRIPT_MARGIN_SECS,
+        // The prepare loop runs on the same clock as the page load, so its
+        // budget has to be covered here too or a slow transcript panel would
+        // time the whole call out.
+        wait_secs + SCRIPT_MARGIN_SECS + u64::from(PREPARE_TICKS) / 2,
     )
     .await;
     logger::log_completion(
@@ -353,6 +440,48 @@ mod tests {
         );
         assert!(Format::Markdown.extract_js(true).ends_with(")(true)"));
         assert!(Format::Markdown.extract_js(false).ends_with(")(false)"));
+    }
+
+    #[test]
+    fn markdown_tries_youtube_before_the_article_extractor() {
+        for links in [false, true] {
+            let js = Format::Markdown.extract_js(links);
+            let youtube = js
+                .find("youtube.com")
+                .expect("YouTube extractor is present");
+            let article = js
+                .find("Readability")
+                .expect("article extractor is present");
+            assert!(youtube < article, "YouTube must be tried first");
+            // The fallback is what keeps every non-YouTube page working.
+            assert!(js.contains(")() || ("), "the two must be chained with ||");
+        }
+    }
+
+    #[test]
+    fn only_markdown_reaches_into_the_page_before_extracting() {
+        assert_eq!(Format::Markdown.prepare_js(), OPEN_TRANSCRIPT_JS);
+        for format in [Format::Text, Format::Html] {
+            assert_eq!(format.prepare_js(), ALREADY_READY_JS);
+        }
+    }
+
+    #[test]
+    fn every_prepare_step_can_answer_ready() {
+        // The AppleScript loop exits on "ready" and otherwise spends its whole
+        // budget, so a step with no path to that string would stall the fetch.
+        for format in [Format::Markdown, Format::Text, Format::Html] {
+            assert!(format.prepare_js().contains(r#""ready""#));
+        }
+    }
+
+    #[test]
+    fn only_markdown_gets_youtube_handling() {
+        // `text` and `html` are the documented way to read a watch page as a
+        // page; they must stay untouched by the chain.
+        for format in [Format::Text, Format::Html] {
+            assert!(!format.extract_js(false).contains("youtube.com"));
+        }
     }
 
     #[test]

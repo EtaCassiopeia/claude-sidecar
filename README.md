@@ -289,6 +289,61 @@ Wikipedia article by 40%. Turn it on when the agent needs to follow links.
 If the extractor picks the wrong block on some page, fall back to
 `"format":"text"`.
 
+**On YouTube.** A watch page is the one case where the article extractor cannot
+win: what a reader wants from a video is what is *said* in it, and that is not
+in the page's prose. So `markdown` recognises watch URLs (`/watch?v=…` and
+`/shorts/…`) and returns the transcript instead of the DOM, with the metadata
+and the sidebar links around it:
+
+```bash
+curl -s -X POST http://localhost:8765/browser/fetch \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://www.youtube.com/watch?v=aircAruvnKk"}'
+```
+```markdown
+# But what is a neural network? | Deep learning chapter 1
+
+- **Channel:** 3Blue1Brown
+- **Video:** https://www.youtube.com/watch?v=aircAruvnKk
+- **Published:** 2017-10-05
+- **Duration:** 18:40
+- **Views:** 23,934,603
+- **Captions:** 31 languages
+
+## Description
+…
+## Related videos
+- [Gradient descent, how neural networks learn | Deep Learning Chapter 2](https://www.youtube.com/watch?v=IHZwWFHWa-w) — 3Blue1Brown · 20:33
+…
+## Transcript
+
+[0:04] This is a 3. It's sloppily written and rendered at an extremely low resolution…
+```
+
+The transcript comes from the panel YouTube renders behind "Show transcript",
+which `/browser/fetch` opens in its throwaway tab before extracting. That is a
+deliberate detour: the `timedtext` caption URL the page hands out answers `200`
+with an empty body unless the request carries a token only the player can mint,
+and the `get_transcript` InnerTube endpoint rejects an unsigned request with
+`FAILED_PRECONDITION`. The rendered panel is the one source that stays readable,
+and it is the same text a viewer sees.
+
+Three consequences worth knowing:
+
+- **Sections are ordered shortest-first** — metadata, description, related
+  videos, then the transcript. With `max_chars` set, truncation eats the
+  transcript tail instead of swallowing the links.
+- **Captions are grouped into ~600-character paragraphs**, each stamped with the
+  time of its first line (`[12:30]`), so a model can still cite a moment without
+  paying for one newline per spoken phrase.
+- **`/browser/tab` does not open the panel.** It reads the tab you are looking
+  at, and clicking things there would be reaching into your session; you get the
+  metadata and related videos, plus the transcript only if you already opened it.
+
+A video with no captions still returns metadata and related videos, with the
+transcript section saying why it is empty rather than coming back silently
+blank. `"format":"text"` reads a watch page as an ordinary page.
+
 ### `GET /browser/tab` — read the currently focused tab (macOS)
 
 Returns the page the user is looking at right now — navigate somewhere
