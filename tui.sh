@@ -33,7 +33,14 @@ fi
 # cannot handle a signal until something resumes it. Only one process group can
 # own the tty, so a leftover TUI reading stdin from the background takes SIGTTIN
 # and suspends, which is what filled the shell with `[1] … [9] suspended` jobs.
-kill_previous sidecar-tui
+#
+# Fatal if one survives. `exec`ing a second TUI onto a tty another is still
+# reading is precisely the fight described above, and the new one loses it just
+# as readily as the old — better to say so than to hand back a suspended job.
+if ! kill_previous_tui; then
+  echo "Refusing to start: a previous sidecar-tui survived SIGKILL." >&2
+  exit 1
+fi
 
 echo "Building sidecar-tui ($PROFILE)..."
 cd "$REPO_DIR"

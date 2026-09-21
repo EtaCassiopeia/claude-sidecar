@@ -8,6 +8,8 @@ set -euo pipefail
 # On macOS, installs missing tools via Homebrew automatically.
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=kill-previous.sh
+source "${REPO_DIR}/kill-previous.sh"
 BIN_DIR="${HOME}/.local/bin"
 BINARY="${BIN_DIR}/claude-sidecar"
 CLAUDE_MD="${HOME}/.claude/CLAUDE.md"
@@ -61,11 +63,7 @@ if ! command -v gh &>/dev/null; then
 fi
 green "  gh $(gh --version | head -1 | awk '{print $3}')"
 
-# ── 2. Auth pre-flight ────────────────────────────────────────────────────────
-step "Auth pre-flight checks"
-bash "${REPO_DIR}/check-auth.sh" || true  # non-fatal: installation continues regardless
-
-# ── 3. Build ──────────────────────────────────────────────────────────────────
+# ── 2. Build ──────────────────────────────────────────────────────────────────
 step "Building claude-sidecar"
 cd "$REPO_DIR"
 cargo build --release
@@ -80,7 +78,18 @@ cp target/release/claude-sidecar "${BINARY}.new"
 mv -f "${BINARY}.new" "$BINARY"
 green "  built → $BINARY"
 
-# ── 4. PATH ───────────────────────────────────────────────────────────────────
+# Drop an install left behind under the upstream `-rs` crate name. It is the same
+# daemon bound to the same port, so leaving it on PATH means a shell RC autostart
+# line, a stale alias, or plain tab-completion can start the *old* build and the
+# new one then fails to bind. Removing the file is what makes that unrepeatable;
+# `kill_previous_sidecar` only stops the copy that happens to be running now.
+STALE_BINARY="${BIN_DIR}/claude-sidecar-rs"
+if [[ -e "$STALE_BINARY" ]]; then
+  rm -f "$STALE_BINARY"
+  yellow "  removed stale install → $STALE_BINARY"
+fi
+
+# ── 3. PATH ───────────────────────────────────────────────────────────────────
 step "Ensuring ~/.local/bin is in PATH"
 
 SHELL_RC=""
@@ -96,34 +105,74 @@ else
   green "  ~/.local/bin already in PATH config"
 fi
 
-# ── 5. Auto-start in shell RC ─────────────────────────────────────────────────
+# ── 4. Auto-start in shell RC ─────────────────────────────────────────────────
 step "Wiring auto-start in shell RC"
 
 if [[ -n "$SHELL_RC" ]]; then
-  # Remove any previous autostart block so re-running upgrades it in place. The
-  # original used `pgrep -x` without `-a`, which silently fails inside the
-  # sidecar's own env-capture shell and spawns a rival every TTL.
+  # Remove any previous autostart block so re-running upgrades it in place.
   if grep -qF 'claude-sidecar auto-start' "$SHELL_RC" 2>/dev/null; then
     python3 - "$SHELL_RC" << 'PYEOF'
 import pathlib, re, sys
+
 p = pathlib.Path(sys.argv[1])
-text = p.read_text()
-# Everything from the marker through the block's closing `fi`. Matching the
-# continuation lines by prefix (an earlier attempt) silently left the body behind
-# when a comment was added to the block, so a re-run stacked a second autostart:
-# anchor on the terminator instead, which is what actually delimits it.
-text = re.sub(
-    r"\n*# ?─*\s*claude-sidecar auto-start\s*─*\n(?:.*\n)*?fi\n",
-    "\n",
-    text,
-)
+lines = p.read_text().split("\n")
+
+BEGIN = "# >>> claude-sidecar auto-start >>>"
+END = "# <<< claude-sidecar auto-start <<<"
+# Any marker this block has ever been written with, decorations and all.
+MARKER = re.compile(r"^#\s*[─<>-]*\s*claude-sidecar auto-start\s*[─<>-]*\s*$")
+# A line that can plausibly belong to the block. Anything else ends it.
+OURS = re.compile(r"^(#|if\b|fi$|\s+claude-sidecar\b|pgrep\b|claude-sidecar\b)")
+
+# Why a bounded line scan and not one regex: the block has shipped in two shapes,
+# and only the newer one ends in `fi`. A pattern anchored on `fi` therefore ran
+# past the older one-liner form and matched the *next* `fi` in the file — which,
+# once both forms were present, meant everything between them. On a real shell rc
+# that was 104 lines of unrelated user functions, silently deleted on the second
+# install. The scan below can only ever consume lines it recognizes, stops at the
+# first blank line, and is capped, so the worst case is leaving a stale block
+# behind rather than eating someone's config.
+out, i, removed = [], 0, 0
+while i < len(lines):
+    if not MARKER.match(lines[i]):
+        out.append(lines[i])
+        i += 1
+        continue
+    # Sentinel form: exact, delimited, no guessing needed.
+    if lines[i].strip() == BEGIN:
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != END:
+            j += 1
+        i = j + 1 if j < len(lines) else j
+        removed += 1
+        continue
+    # Legacy form: consume only recognizable lines, and stop at the terminator.
+    i += 1
+    for _ in range(20):
+        if i >= len(lines):
+            break
+        line = lines[i]
+        if not line.strip() or not OURS.match(line):
+            break
+        i += 1
+        # `fi` closes the if/fi shape; a trailing `&` closes the one-liner shape.
+        if line.strip() == "fi" or line.rstrip().endswith("&"):
+            break
+    removed += 1
+
+text = "\n".join(out)
+# Collapse the blank runs the removal leaves behind.
+text = re.sub(r"\n{3,}", "\n\n", text).rstrip() + "\n"
 p.write_text(text)
+print(f"  removed {removed} previous auto-start block(s)")
 PYEOF
-    yellow "  removed previous auto-start block"
   fi
 
+  # Sentinels, so the next upgrade delimits this block exactly instead of
+  # inferring where it ends.
   cat >> "$SHELL_RC" << 'AUTOSTART'
-# ── claude-sidecar auto-start ──
+
+# >>> claude-sidecar auto-start >>>
 # `pgrep -a` is required: without it macOS pgrep excludes the caller's own
 # ancestors, so the sidecar's env-capture shell (a child of the sidecar) never
 # sees the running server and launches a rival that dies on EADDRINUSE.
@@ -134,11 +183,12 @@ PYEOF
 if [[ -z "${SIDECAR_ENV_CAPTURE:-}" ]] && ! pgrep -ax claude-sidecar >/dev/null 2>&1; then
   claude-sidecar --detach >>"${TMPDIR:-/tmp}/claude-sidecar-$$.log" 2>&1
 fi
+# <<< claude-sidecar auto-start <<<
 AUTOSTART
   green "  auto-start wired in $SHELL_RC"
 fi
 
-# ── 6. PreToolUse hook ────────────────────────────────────────────────────────
+# ── 5. PreToolUse hook ────────────────────────────────────────────────────────
 step "Installing PreToolUse redirect hook"
 
 # Write hook script from the repo copy (canonical source of truth)
@@ -166,7 +216,7 @@ print("  wired")
 PYEOF
 green "  hook wired in $SETTINGS"
 
-# ── 7. ~/.claude/CLAUDE.md ────────────────────────────────────────────────────
+# ── 6. ~/.claude/CLAUDE.md ────────────────────────────────────────────────────
 step "Patching ~/.claude/CLAUDE.md"
 
 # Patch using the canonical block stored in the repo. The block carries explicit
@@ -233,14 +283,35 @@ else:
 PYEOF
 green "  $CLAUDE_MD patched"
 
-# ── 8. Smoke test ─────────────────────────────────────────────────────────────
+# ── 7. Smoke test ─────────────────────────────────────────────────────────────
 step "Starting sidecar and running smoke tests"
 
-pkill -x claude-sidecar 2>/dev/null && sleep 0.3 || true
-"$BINARY" >>"${TMPDIR:-/tmp}/claude-sidecar-smoke.log" 2>&1 &
-SIDECAR_PID=$!
-sleep 0.6
+# The shared helper, not a bare `pkill`: that sent one SIGTERM, never resumed a
+# stopped process so it could handle the signal, never escalated to SIGKILL, and
+# then slept a flat 0.3s whether or not anything had exited. A survivor keeps
+# port 8765, so the smoke test below would be answered by the *old* binary and
+# the install would report success without having tested what it just built.
+if ! kill_previous_sidecar; then
+  red "  a previous sidecar survived SIGKILL — cannot smoke-test this build"; exit 1
+fi
+if ! wait_port_free 8765; then
+  red "  port 8765 is still held (see above) — cannot smoke-test this build"; exit 1
+fi
+# `--detach`, and the pid is deliberately not captured. The old form backgrounded
+# the daemon with a bare `&` and recorded `$!` that nothing ever read, so the
+# install ended with a sidecar still holding the installing terminal as its
+# controlling tty — the exact process-group contention that suspends sidecar-tui,
+# left behind by the script that documents the problem. Detaching makes the
+# survivor correct rather than accidental: it is the daemon the user wants
+# running, in its own session, and `kill_previous_sidecar` can stop it by name.
+"$BINARY" --detach >>"${TMPDIR:-/tmp}/claude-sidecar-smoke.log" 2>&1
 SIDECAR_LOG="${TMPDIR:-/tmp}/claude-sidecar-smoke.log"
+# Wait for the socket, not a flat sleep: the detaching parent returns immediately,
+# so `sleep 0.6` was racing the child's bind on a cold start.
+for _ in $(seq 1 25); do
+  curl -s http://localhost:8765/health 2>/dev/null | grep -q '"status":"ok"' && break
+  sleep 0.2
+done
 
 if curl -s http://localhost:8765/health | grep -q '"version":"3"'; then
   green "  /health OK (v3)"
