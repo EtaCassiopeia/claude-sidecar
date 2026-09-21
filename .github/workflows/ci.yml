@@ -1,0 +1,61 @@
+name: CI
+
+# The sidecar is a macOS tool — the browser bridge drives Chrome through
+# osascript and the Docs reader reads a local Drive mount — so CI runs on macOS
+# rather than a cheaper Linux runner. Testing on a platform the tool does not
+# target would prove the wrong thing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing until something fails, and a CI failure with no
+  # trace is a second run wasted.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  # A new push supersedes the run in flight for the same ref. macOS minutes are
+  # billed at a premium, and nobody reads the result of a superseded run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: macos-latest
+    # The DataFusion dependency tree dominates the build; a cold cache is
+    # several times slower than the tests themselves.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Ordered cheapest-first so an obvious failure reports in seconds rather
+      # than after a full build: formatting needs no compilation at all.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` covers tests and benches, not just the library; a lint
+      # that only fires under `cfg(test)` is still a lint.
+      - name: Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      # Proves the profile that actually ships. It is the only place the
+      # vendored mermaid bundle and the thin-LTO settings get exercised, and a
+      # release-only failure (the fat-LTO OOM this profile exists to avoid) would
+      # otherwise reach a user before CI.
+      - name: Release build
+        run: cargo build --release --all-features
