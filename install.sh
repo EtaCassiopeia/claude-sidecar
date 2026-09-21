@@ -91,15 +91,43 @@ fi
 # ── 5. Auto-start in shell RC ─────────────────────────────────────────────────
 step "Wiring auto-start in shell RC"
 
-if [[ -n "$SHELL_RC" ]] && ! grep -qF 'claude-sidecar auto-start' "$SHELL_RC" 2>/dev/null; then
-  cat >> "$SHELL_RC" << 'AUTOSTART'
+if [[ -n "$SHELL_RC" ]]; then
+  # Remove any previous autostart block so re-running upgrades it in place. The
+  # original used `pgrep -x` without `-a`, which silently fails inside the
+  # sidecar's own env-capture shell and spawns a rival every TTL.
+  if grep -qF 'claude-sidecar auto-start' "$SHELL_RC" 2>/dev/null; then
+    python3 - "$SHELL_RC" << 'PYEOF'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+# Everything from the marker through the block's closing `fi`. Matching the
+# continuation lines by prefix (an earlier attempt) silently left the body behind
+# when a comment was added to the block, so a re-run stacked a second autostart:
+# anchor on the terminator instead, which is what actually delimits it.
+text = re.sub(
+    r"\n*# ?─*\s*claude-sidecar auto-start\s*─*\n(?:.*\n)*?fi\n",
+    "\n",
+    text,
+)
+p.write_text(text)
+PYEOF
+    yellow "  removed previous auto-start block"
+  fi
 
-# claude-sidecar auto-start
-pgrep -x claude-sidecar >/dev/null || claude-sidecar >>"${TMPDIR:-/tmp}/claude-sidecar.log" 2>&1 &
+  cat >> "$SHELL_RC" << 'AUTOSTART'
+# ── claude-sidecar auto-start ──
+# `pgrep -a` is required: without it macOS pgrep excludes the caller's own
+# ancestors, so the sidecar's env-capture shell (a child of the sidecar) never
+# sees the running server and launches a rival that dies on EADDRINUSE.
+# SIDECAR_ENV_CAPTURE marks that capture shell — never autostart from it.
+# `--detach` puts the daemon in its own session: started from here it would
+# otherwise inherit this terminal and compete with sidecar-tui for it, and the
+# TUI is what loses — SIGTTIN on its next stdin read, then suspended.
+if [[ -z "${SIDECAR_ENV_CAPTURE:-}" ]] && ! pgrep -ax claude-sidecar >/dev/null 2>&1; then
+  claude-sidecar --detach >>"${TMPDIR:-/tmp}/claude-sidecar-$$.log" 2>&1
+fi
 AUTOSTART
-  green "  added auto-start to $SHELL_RC"
-else
-  green "  auto-start already wired"
+  green "  auto-start wired in $SHELL_RC"
 fi
 
 # ── 6. PreToolUse hook ────────────────────────────────────────────────────────
@@ -133,39 +161,67 @@ green "  hook wired in $SETTINGS"
 # ── 7. ~/.claude/CLAUDE.md ────────────────────────────────────────────────────
 step "Patching ~/.claude/CLAUDE.md"
 
-# Patch using the canonical block stored in the repo
+# Patch using the canonical block stored in the repo. The block carries explicit
+# BEGIN/END sentinels so its own bash examples cannot be mistaken for its edges.
 python3 - "$CLAUDE_MD" "${REPO_DIR}/assets/claude-md-block.md" << 'PYEOF'
 import sys, pathlib
 target, block_path = sys.argv[1], sys.argv[2]
 new_block = pathlib.Path(block_path).read_text().strip()
-marker = new_block.split('\n')[0]  # first line is the heading
+BEGIN = new_block.split('\n')[0]
+END = new_block.rsplit('\n', 1)[-1]
+HEADING = '# Sidecar — Running Blocked or Long Commands'
+# The last line of the block's final section, in every version shipped so far.
+LEGACY_TAIL = 'curl -s http://localhost:8765/health'
 try:
     text = pathlib.Path(target).read_text()
 except FileNotFoundError:
     text = ""
 
-# Find top-level headings, ignoring fenced code — the block is full of bash
-# comments ("# 3. Final status") that look exactly like `# ` headings, and
-# treating one as a section boundary truncates the block mid-replacement and
-# leaves the remainder orphaned in the file.
-lines = text.split('\n')
-tops, fenced = [], False
-for i, line in enumerate(lines):
-    if line.lstrip().startswith('```'):
-        fenced = not fenced
-    elif not fenced and line.startswith('# '):
-        tops.append(i)
+def strip_sentinel_blocks(s):
+    """Remove every BEGIN..END region. Repeated installs must converge."""
+    n = 0
+    while True:
+        i = s.find(BEGIN)
+        if i < 0:
+            return s, n
+        j = s.find(END, i)
+        if j < 0:
+            return s[:i].rstrip() + '\n', n + 1
+        s = s[:i].rstrip() + '\n\n' + s[j + len(END):].lstrip('\n')
+        n += 1
 
-start = next((i for i in tops if lines[i].rstrip() == marker), None)
-if start is None:
-    with open(target, "a") as f:
-        f.write(("\n\n" if text.strip() else "") + new_block + "\n")
-    print("  appended new block")
+def strip_legacy(s):
+    """Heal pre-sentinel installs.
+
+    The old patcher ended the block with a lookahead for the next `^# `, which
+    matched a `# → {"stdout": …}` comment inside the block's own bash fence. So it
+    replaced a fragment and appended a whole new copy every run, leaving several
+    overlapping copies with *unbalanced* code fences — which is why neither fence
+    tracking nor heading detection can find the real edge.
+
+    Every version of this block has ended with the `## Health check` section, so
+    that is the anchor: cut from the first legacy heading through the fence that
+    closes the last Health check section.
+    """
+    i = s.find(HEADING)
+    if i < 0:
+        return s, 0
+    anchor = s.rfind(LEGACY_TAIL)
+    if anchor < i:
+        return s, 0
+    close = s.find('```', anchor + len(LEGACY_TAIL))
+    end = len(s) if close < 0 else close + 3
+    return (s[:i].rstrip() + '\n\n' + s[end:].lstrip('\n')), 1
+
+text, removed = strip_sentinel_blocks(text)
+text, legacy = strip_legacy(text)
+text = text.rstrip()
+out = (text + '\n\n' if text else '') + new_block + '\n'
+pathlib.Path(target).write_text(out)
+if removed or legacy:
+    print(f"  replaced block (removed {removed} managed, {legacy} legacy)")
 else:
-    end = next((i for i in tops if i > start), len(lines))
-    lines[start:end] = new_block.split('\n') + ['']
-    pathlib.Path(target).write_text('\n'.join(lines))
-    print("  updated existing block")
+    print("  appended new block")
 PYEOF
 green "  $CLAUDE_MD patched"
 
@@ -173,13 +229,15 @@ green "  $CLAUDE_MD patched"
 step "Starting sidecar and running smoke tests"
 
 pkill -x claude-sidecar 2>/dev/null && sleep 0.3 || true
-"$BINARY" >>"${TMPDIR:-/tmp}/claude-sidecar.log" 2>&1 &
+"$BINARY" >>"${TMPDIR:-/tmp}/claude-sidecar-smoke.log" 2>&1 &
+SIDECAR_PID=$!
 sleep 0.6
+SIDECAR_LOG="${TMPDIR:-/tmp}/claude-sidecar-smoke.log"
 
 if curl -s http://localhost:8765/health | grep -q '"version":"3"'; then
   green "  /health OK (v3)"
 else
-  red "  /health failed — check ${TMPDIR:-/tmp}/claude-sidecar.log"; exit 1
+  red "  /health failed — check $SIDECAR_LOG"; exit 1
 fi
 
 EXEC_OUT=$(curl -s -X POST http://localhost:8765/exec \
@@ -193,8 +251,33 @@ sleep 0.5
 STATUS=$(curl -s "http://localhost:8765/jobs/$JOB_ID/status")
 echo "$STATUS" | grep -q '"running":false' && green "  /jobs OK" || { red "  /jobs failed: $STATUS"; exit 1; }
 
-HOOK_OUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"sbt validate"}}' | python3 "$HOOK")
-echo "$HOOK_OUT" | grep -q '"permissionDecision":"deny"' && green "  hook OK" || { red "  hook failed"; exit 1; }
+HOOK_OUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"sbt validate"},"session_id":"install-selftest"}' | python3 "$HOOK")
+# Read the decision out of the JSON rather than grepping the serialized form:
+# json.dumps puts a space after the colon, which a literal pattern misses.
+HOOK_DECISION=$(printf '%s' "$HOOK_OUT" | python3 -c \
+  'import json,sys; print(json.load(sys.stdin).get("hookSpecificOutput",{}).get("permissionDecision",""))' \
+  2>/dev/null)
+[[ "$HOOK_DECISION" == "deny" ]] && green "  hook OK" || { red "  hook failed: $HOOK_OUT"; exit 1; }
+
+# The hook must put the session id into the command it suggests, or every call
+# lands unattributed and the metrics store cannot group by session.
+if printf '%s' "$HOOK_OUT" | grep -q 'install-selftest'; then
+  green "  hook passes session_id OK"
+else
+  red "  hook did not include session_id in its suggested command"; exit 1
+fi
+
+# End-to-end: a session-tagged call must be queryable by session.
+curl -s -o /dev/null -X POST http://localhost:8765/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":"git","args":["--version"],"session_id":"install-selftest"}'
+SESSIONS=$("$BINARY" query \
+  "SELECT session FROM calls WHERE session = 'install-selftest' LIMIT 1" 2>/dev/null || true)
+if printf '%s' "$SESSIONS" | grep -q 'install-selftest'; then
+  green "  session attribution OK"
+else
+  yellow "  session attribution not visible yet (metrics may be disabled)"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 printf '\n'
@@ -206,9 +289,7 @@ printf '  Binary:        %s\n' "$BINARY"
 printf '  Hook:          %s\n' "$HOOK"
 printf '  CLAUDE.md:     %s\n' "$CLAUDE_MD"
 printf '  settings.json: %s\n' "$SETTINGS"
-printf '  Log:           %s\n' "${TMPDIR:-/tmp}/claude-sidecar.log"
+printf '  Log:           %s\n' "${TMPDIR:-/tmp}/claude-sidecar-<pid>.log"
 printf '\n'
 [[ -n "$SHELL_RC" ]] && yellow "  Restart your shell or: source $SHELL_RC"
 printf '\n'
-
-

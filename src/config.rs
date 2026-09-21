@@ -1,139 +1,135 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Commands allowed to be executed by the sidecar. Edit this list to match the
-/// build, test, and VCS tools you want reachable from the sandbox.
-pub const ALLOWED_COMMANDS: &[&str] = &[
-    // VCS & forges
-    "gh",
-    "git",
-    // Build & test
-    "go",
-    "sbt",
-    "cargo",
-    "mvn",
-    "gradle",
-    "npm",
-    "node",
-    "python3",
-    "pytest",
-    // Network
-    "curl",
-    // Containers
-    "docker",
-    "docker-compose",
-    // File inspection & editing
-    "grep",
-    "rg",
-    "find",
-    "ls",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "diff",
-    "sed",
-    "awk",
-    "sort",
-    "uniq",
-    "cut",
-    "tr",
-    "xargs",
-    "cp",
-    "mv",
-    "rm",
-    "mkdir",
-    "touch",
-    "chmod",
-    // Text / data
-    "jq",
-    "yq",
-    // Shell
-    "bash",
-    "sh",
-    // Shell utilities
-    "which",
-    "env",
-    "printenv",
-    "echo",
-    "printf",
-    "date",
-    "uname",
-    "sysctl",
-    // Keychain
-    "security",
-];
+use serde::Deserialize;
 
-/// Flags that allow arbitrary code execution when passed to interpreter
-/// commands. Blocking these prevents `python3 -c "os.system(...)"` and
-/// equivalent escapes through node, perl, ruby, etc.
+/// Commands refused regardless of configuration.
 ///
-/// The check is applied only to commands that are interpreters — tools like
-/// `cargo` or `git` take `-c` with harmless semantics and are not in this set.
-const INTERPRETER_EXEC_FLAGS: &[&str] = &[
-    "-c",
-    "--command", // python3, node, perl, ruby, sh, bash …
-    "-e",
-    "--eval", // node, perl, ruby
-    "-",      // read script from stdin
-    "--",     // some interpreters treat this as stdin marker
-];
-
-/// Commands that are scripting interpreters and must have their arguments
-/// checked for inline-execution flags.
+/// `sudo` is the one entry because privilege escalation is the only class the
+/// sidecar can meaningfully refuse: everything else it might block is reachable
+/// anyway through an exec wrapper (`env`, `xargs`, `make`, `sbt`, a shell
+/// script), so a longer list would describe a boundary that does not exist.
 ///
-/// The POSIX shells (`sh`, `bash`, `zsh`) are intentionally *not* here: callers
-/// are permitted to run `bash -c "<compound command>"`, so their `-c` string is
-/// passed through unchecked. Note that this makes the top-level command
-/// allowlist advisory rather than enforcing — a `bash -c` string can invoke any
-/// binary on the machine, including ones not in `ALLOWED_COMMANDS`. This matches
-/// the capability already reachable through the allowlisted `python3`, `node`,
-/// `docker`, and `curl`, and is enabled deliberately.
-const INTERPRETER_COMMANDS: &[&str] = &["python3", "node", "perl", "ruby"];
+/// This is not a containment boundary. The sidecar runs as the user, on the
+/// user's machine — a caller who can reach it can already run code as that user.
+/// The denylist exists so the obvious escalation attempt fails loudly rather
+/// than silently succeeding.
+pub const DEFAULT_DENIED_COMMANDS: &[&str] = &["sudo"];
 
-/// Check whether a command name is on the allowlist.
-pub fn is_allowed(cmd: &str) -> bool {
-    ALLOWED_COMMANDS.contains(&cmd)
+/// Command-execution policy: deny-by-exception. Every command is permitted
+/// except those named in `denied`.
+///
+/// Replaces the allowlist this file used to carry. That list had grown to ~75
+/// entries and still could not hold its own stated line — `env /usr/bin/openssl`
+/// reached a binary the list explicitly excluded — because so many allowlisted
+/// tools are general-purpose exec wrappers. A denylist is the honest shape: it
+/// states the few things deliberately not bridged instead of implying the rest
+/// are contained.
+#[derive(Debug, Clone)]
+pub struct Policy {
+    denied: HashSet<String>,
 }
 
-/// Check whether the arguments are safe for the given command.
-///
-/// Returns `Ok(())` if safe, or `Err(reason)` describing why the invocation
-/// was rejected. Called after `is_allowed` passes.
-///
-/// # What this blocks
-///
-/// Scripting interpreters (`python3`, `node`, …) accept flags like `-c` and
-/// `-e` that execute an arbitrary string as code. Those strings can call
-/// `os.system`, `subprocess`, `child_process.exec`, etc. — completely bypassing
-/// the top-level allowlist. This function rejects any such invocation.
-///
-/// All other allowlisted commands (build tools, git, curl, …) are passed
-/// through without argument inspection because they do not have inline
-/// code-execution semantics.
-pub fn check_args(cmd: &str, args: &[String]) -> Result<(), String> {
-    if !INTERPRETER_COMMANDS.contains(&cmd) {
-        return Ok(());
-    }
-    for arg in args {
-        // Exact match against known exec flags.
-        if INTERPRETER_EXEC_FLAGS.contains(&arg.as_str()) {
-            return Err(format!(
-                "inline execution flag `{arg}` is not allowed for `{cmd}`; \
-                 pass a script file path instead"
-            ));
-        }
-        // Combined short flags like `-ci` or `-ec` that embed an exec flag.
-        if arg.starts_with('-') && !arg.starts_with("--") {
-            let inner = arg.trim_start_matches('-');
-            if inner.contains('c') || inner.contains('e') {
-                return Err(format!(
-                    "flag `{arg}` contains an inline execution flag and is not \
-                     allowed for `{cmd}`"
-                ));
-            }
+/// On-disk form of [`Policy`]. Separate from `Policy` so the file can grow
+/// optional keys without the runtime type carrying `Option`s.
+#[derive(Debug, Default, Deserialize)]
+struct PolicyFile {
+    /// Commands to refuse. Replaces the default set entirely when present.
+    #[serde(default)]
+    denied: Option<Vec<String>>,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            denied: DEFAULT_DENIED_COMMANDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         }
     }
-    Ok(())
+}
+
+impl Policy {
+    /// Is this command permitted?
+    ///
+    /// Matched on the basename, so `/usr/bin/sudo` and `sudo` are the same
+    /// decision — otherwise a denial would be one absolute path away from
+    /// meaningless.
+    pub fn allows(&self, cmd: &str) -> bool {
+        !self.denied.contains(basename(cmd))
+    }
+
+    pub fn denied(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self.denied.iter().map(String::as_str).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Parse a policy from TOML. An absent or empty `denied` key means an empty
+    /// denylist — the file is authoritative, so a user who writes `denied = []`
+    /// gets exactly that rather than having the defaults reappear.
+    fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
+        let file: PolicyFile = toml::from_str(text)?;
+        Ok(match file.denied {
+            Some(denied) => Self {
+                denied: denied.into_iter().collect(),
+            },
+            None => Self::default(),
+        })
+    }
+}
+
+/// Strip any directory prefix from a command name.
+fn basename(cmd: &str) -> &str {
+    cmd.rsplit('/').next().unwrap_or(cmd)
+}
+
+/// Path of the policy file: `$SIDECAR_CONFIG`, else
+/// `$XDG_CONFIG_HOME/claude-sidecar/config.toml`, else
+/// `~/.config/claude-sidecar/config.toml`.
+pub fn config_path() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("SIDECAR_CONFIG") {
+        return Some(PathBuf::from(explicit));
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("claude-sidecar").join("config.toml"))
+}
+
+/// Load the policy from `path`.
+///
+/// A missing file yields the defaults — the sidecar must run out of the box. A
+/// *malformed* file is a hard error: silently falling back to defaults would
+/// mean a user who wrote a denial and fat-fingered the syntax gets a sidecar
+/// that permits what they just tried to refuse.
+pub fn load_policy_from(path: &Path) -> Result<Policy, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Policy::from_toml(&text)
+            .map_err(|e| format!("invalid policy file {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Policy::default()),
+        Err(e) => Err(format!("cannot read policy file {}: {e}", path.display())),
+    }
+}
+
+static POLICY: OnceLock<Policy> = OnceLock::new();
+
+/// Install the process-wide policy. Called once at startup, before serving.
+pub fn init_policy(policy: Policy) {
+    let _ = POLICY.set(policy);
+}
+
+/// The active policy. Falls back to the defaults if `init_policy` was never
+/// called (unit tests, and any future embedding of the library).
+pub fn policy() -> &'static Policy {
+    POLICY.get_or_init(Policy::default)
+}
+
+/// Check whether a command may be executed under the active policy.
+pub fn is_allowed(cmd: &str) -> bool {
+    policy().allows(cmd)
 }
 
 /// Common install prefixes to probe before falling back to a `PATH` lookup
@@ -152,6 +148,9 @@ pub struct Config {
     /// instead of being dropped, so the full log stays retrievable.
     pub spill_to_disk: bool,
     pub job_ttl_secs: u64,
+    /// Seconds a `SIGTERM`'d job gets to exit before `SIGKILL`. `0` skips
+    /// straight to `SIGKILL` (the behavior before the ladder existed).
+    pub kill_grace_secs: u64,
 }
 
 impl Default for Config {
@@ -163,14 +162,21 @@ impl Default for Config {
             max_lines_per_job: 50_000,
             spill_to_disk: false,
             job_ttl_secs: 600,
+            kill_grace_secs: 5,
         }
     }
 }
 
 /// Resolve a command name to an absolute path.
 ///
-/// Tries common install prefixes first, then falls back to a `PATH` search.
+/// A path-qualified command (`/usr/bin/env`, `./script.sh`) is used as given;
+/// a bare name is looked up in the common install prefixes first, then `PATH`.
 pub fn resolve(cmd: &str) -> Option<PathBuf> {
+    if cmd.contains('/') {
+        let path = PathBuf::from(cmd);
+        return path.exists().then_some(path);
+    }
+
     for prefix in INSTALL_PREFIXES {
         let path = PathBuf::from(prefix).join(cmd);
         if path.exists() {
@@ -191,60 +197,95 @@ pub fn resolve(cmd: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    #[test]
+    fn default_policy_denies_only_sudo() {
+        let p = Policy::default();
+        assert!(!p.allows("sudo"));
+        assert_eq!(p.denied(), vec!["sudo"]);
     }
 
     #[test]
-    fn interpreter_inline_c_flag_blocked() {
-        assert!(check_args("python3", &args(&["-c", "import os; os.system('id')"])).is_err());
-        assert!(check_args(
-            "node",
-            &args(&["-e", "require('child_process').exec('id')"])
-        )
-        .is_err());
+    fn default_policy_allows_everything_else() {
+        let p = Policy::default();
+        // Including the tools the old allowlist had to be edited to admit, and
+        // the ones it excluded but could not actually keep out.
+        for cmd in [
+            "git",
+            "sbt",
+            "cargo",
+            "aws",
+            "claude-medic",
+            "openssl",
+            "ln",
+            "env",
+            "xargs",
+            "some-new-tool-nobody-has-heard-of",
+        ] {
+            assert!(p.allows(cmd), "`{cmd}` should be permitted by default");
+        }
     }
 
     #[test]
-    fn interpreter_stdin_flag_blocked() {
-        assert!(check_args("python3", &args(&["-"])).is_err());
+    fn denial_matches_on_basename() {
+        // Otherwise `/usr/bin/sudo` walks straight past a `sudo` denial.
+        let p = Policy::default();
+        assert!(!p.allows("/usr/bin/sudo"));
+        assert!(!p.allows("../../usr/bin/sudo"));
     }
 
     #[test]
-    fn interpreter_combined_flag_blocked() {
-        assert!(check_args("python3", &args(&["-ic"])).is_err());
+    fn config_file_replaces_the_default_denylist() {
+        let p = Policy::from_toml("denied = [\"rm\", \"dd\"]").expect("valid toml");
+        assert!(!p.allows("rm"));
+        assert!(!p.allows("dd"));
+        // Replaces rather than extends, so `sudo` is no longer denied.
+        assert!(p.allows("sudo"));
     }
 
     #[test]
-    fn interpreter_script_file_allowed() {
-        assert!(check_args("python3", &args(&["script.py", "--verbose"])).is_ok());
-        assert!(check_args("node", &args(&["index.js"])).is_ok());
+    fn explicitly_empty_denylist_denies_nothing() {
+        // A user who writes `denied = []` means it; the defaults must not
+        // silently reappear.
+        let p = Policy::from_toml("denied = []").expect("valid toml");
+        assert!(p.allows("sudo"));
+        assert!(p.denied().is_empty());
     }
 
     #[test]
-    fn non_interpreter_c_flag_allowed() {
-        // `git -c` sets a config value — not an exec flag, must not be blocked.
-        assert!(check_args("git", &args(&["-c", "user.email=x@y.com", "commit"])).is_ok());
-        assert!(check_args("cargo", &args(&["test", "--", "-c"])).is_ok());
+    fn absent_key_yields_defaults() {
+        let p = Policy::from_toml("").expect("empty toml is valid");
+        assert!(!p.allows("sudo"));
     }
 
     #[test]
-    fn shell_dash_c_allowed() {
-        // Shells are deliberately excluded from the interpreter set: `bash -c`
-        // (and `sh -c`) may run a compound command string.
-        assert!(check_args("bash", &args(&["-c", "git status && ls"])).is_ok());
-        assert!(check_args("sh", &args(&["-c", "echo hi | wc -l"])).is_ok());
+    fn malformed_config_is_an_error_not_a_silent_default() {
+        // Falling back to defaults here would permit exactly what the user was
+        // trying to deny when they made the typo.
+        assert!(Policy::from_toml("denied = \"rm\"").is_err());
+        assert!(Policy::from_toml("denied = [").is_err());
     }
 
     #[test]
-    fn interpreter_exec_flags_still_blocked_for_non_shells() {
-        // The relaxation is shells-only; python3/node inline exec stays blocked.
-        assert!(check_args("python3", &args(&["-c", "import os; os.system('id')"])).is_err());
-        assert!(check_args("node", &args(&["-e", "process.exit(0)"])).is_err());
+    fn missing_file_yields_defaults_but_unreadable_path_errors() {
+        let missing = std::env::temp_dir().join("sc-no-such-policy-file.toml");
+        let _ = std::fs::remove_file(&missing);
+        let p = load_policy_from(&missing).expect("missing file is not an error");
+        assert!(!p.allows("sudo"));
     }
 
     #[test]
-    fn pytest_args_allowed() {
-        assert!(check_args("pytest", &args(&["-v", "--tb=short", "tests/"])).is_ok());
+    fn policy_loads_from_a_real_file() {
+        let path = std::env::temp_dir().join(format!("sc-policy-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "denied = [\"shutdown\"]\n").expect("write temp policy");
+        let p = load_policy_from(&path).expect("valid policy file");
+        assert!(!p.allows("shutdown"));
+        assert!(p.allows("sudo"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_accepts_absolute_paths() {
+        assert_eq!(resolve("/bin/sh"), Some(PathBuf::from("/bin/sh")));
+        assert_eq!(resolve("/nonexistent/binary/xyzzy"), None);
     }
 }

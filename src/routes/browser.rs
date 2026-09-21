@@ -17,13 +17,14 @@
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Json, Query},
+    extract::{Json, Query, State},
     response::Json as JsonResponse,
 };
+use htmd::HtmlToMarkdown;
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, time::timeout};
 
-use crate::{error::SidecarError, logger};
+use crate::{error::SidecarError, events::ActivityKind, logger, AppState};
 
 /// Always present on macOS; deliberately not part of `ALLOWED_COMMANDS` —
 /// callers get these two fixed scripts, not general osascript access.
@@ -161,30 +162,66 @@ pub enum Format {
     Text,
     /// Full DOM (`document.documentElement.outerHTML`).
     Html,
+    /// Full DOM converted to markdown server-side. Keeps everything `Markdown`
+    /// drops, so it is the fallback for a page whose real content the article
+    /// extractor scores away — and for canvas-rendered docs, where `Text`
+    /// returns only the UI chrome. Far smaller than `Html` because scripts,
+    /// styles and `<head>` are skipped during conversion (see
+    /// `html_to_markdown`). For Google Docs/Sheets/Slides use `/gdocs/read`
+    /// instead: it returns the whole document rather than the fraction this
+    /// recovers.
+    Dom,
 }
 
 impl Format {
-    /// `include_links` only reaches the markdown extractor; the text and HTML
-    /// scripts have no notion of it.
+    /// `include_links` only reaches the markdown extractor; the other scripts
+    /// have no notion of it.
     fn extract_js(self, include_links: bool) -> &'static str {
         match self {
             Format::Markdown if include_links => EXTRACT_MARKDOWN_LINKS_JS,
             Format::Markdown => EXTRACT_MARKDOWN_JS,
             Format::Text => EXTRACT_TEXT_JS,
-            Format::Html => EXTRACT_HTML_JS,
+            // `Dom` is derived from the same HTML capture, converted in `finish`.
+            Format::Html | Format::Dom => EXTRACT_HTML_JS,
         }
     }
 
     /// Run repeatedly before extraction until it answers `"ready"`. Only the
     /// markdown path asks the page for anything: it is what opens a YouTube
-    /// transcript panel, while `text` and `html` are documented as reading the
-    /// page exactly as it stands.
+    /// transcript panel, while `text`, `html` and `dom` are documented as
+    /// reading the page exactly as it stands.
     fn prepare_js(self) -> &'static str {
         match self {
             Format::Markdown => OPEN_TRANSCRIPT_JS,
-            Format::Text | Format::Html => ALREADY_READY_JS,
+            Format::Text | Format::Html | Format::Dom => ALREADY_READY_JS,
         }
     }
+
+    /// Post-process a freshly extracted page. `Dom` converts the captured HTML;
+    /// every other format is already in its final shape.
+    fn finish(self, page: Page) -> Result<Page, SidecarError> {
+        match self {
+            Format::Dom => Ok(Page {
+                content: html_to_markdown(&page.content)?,
+                ..page
+            }),
+            Format::Markdown | Format::Text | Format::Html => Ok(page),
+        }
+    }
+}
+
+/// Convert captured HTML to Markdown. The capture is the whole document
+/// (`documentElement.outerHTML`), so non-content tags — styles, scripts,
+/// `<head>` metadata — are skipped; otherwise their text leaks into the output
+/// (e.g. inline CSS rendered as a paragraph). A failure here is a server-side
+/// processing fault (the extraction already succeeded), so it propagates as
+/// `Internal` rather than being silently returned as raw HTML.
+fn html_to_markdown(html: &str) -> Result<String, SidecarError> {
+    HtmlToMarkdown::builder()
+        .skip_tags(vec!["script", "style", "head", "noscript", "iframe"])
+        .build()
+        .convert(html)
+        .map_err(|e| SidecarError::Internal(format!("HTML-to-Markdown conversion failed: {e}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +281,10 @@ impl Page {
 
 /// `POST /browser/fetch` — open a URL in the user's Chrome and return the
 /// rendered page.
-pub async fn fetch(Json(req): Json<FetchRequest>) -> Result<JsonResponse<Page>, SidecarError> {
+pub async fn fetch(
+    State(state): State<AppState>,
+    Json(req): Json<FetchRequest>,
+) -> Result<JsonResponse<Page>, SidecarError> {
     validate_url(&req.url).map_err(SidecarError::InvalidRequest)?;
     let wait_secs = req
         .wait_secs
@@ -262,6 +302,12 @@ pub async fn fetch(Json(req): Json<FetchRequest>) -> Result<JsonResponse<Page>, 
         None,
     );
     let started = Instant::now();
+    let activity = state.events.start(
+        ActivityKind::Browser,
+        "chrome fetch",
+        std::slice::from_ref(&req.url),
+        None,
+    );
     let prepare_ticks = PREPARE_TICKS.to_string();
     let result = run_script(
         FETCH_SCRIPT,
@@ -278,32 +324,51 @@ pub async fn fetch(Json(req): Json<FetchRequest>) -> Result<JsonResponse<Page>, 
         // time the whole call out.
         wait_secs + SCRIPT_MARGIN_SECS + u64::from(PREPARE_TICKS) / 2,
     )
-    .await;
+    .await
+    .and_then(|page| req.format.finish(page));
     logger::log_completion(
         "/browser/fetch",
         Some(if result.is_ok() { 0 } else { 1 }),
         started.elapsed().as_millis(),
     );
+    report(&state, activity, &result);
     result.map(|page| JsonResponse(page.truncate(req.max_chars)))
 }
 
 /// `GET /browser/tab` — return the page currently focused in Chrome. Lets the
 /// user navigate somewhere themselves and say "read this".
-pub async fn tab(Query(q): Query<TabQuery>) -> Result<JsonResponse<Page>, SidecarError> {
+pub async fn tab(
+    State(state): State<AppState>,
+    Query(q): Query<TabQuery>,
+) -> Result<JsonResponse<Page>, SidecarError> {
     logger::log_request("GET", "/browser/tab", "chrome", &[], None);
     let started = Instant::now();
+    let activity = state
+        .events
+        .start(ActivityKind::Browser, "chrome tab", &[], None);
     let result = run_script(
         TAB_SCRIPT,
         &[q.format.extract_js(q.include_links)],
         TAB_TIMEOUT_SECS,
     )
-    .await;
+    .await
+    .and_then(|page| q.format.finish(page));
     logger::log_completion(
         "/browser/tab",
         Some(if result.is_ok() { 0 } else { 1 }),
         started.elapsed().as_millis(),
     );
+    report(&state, activity, &result);
     result.map(|page| JsonResponse(page.truncate(q.max_chars)))
+}
+
+/// Close out an activity from a fallible result: a failure carries its reason
+/// rather than a synthesized exit code it never had.
+fn report(state: &AppState, activity: u64, result: &Result<Page, SidecarError>) {
+    match result {
+        Ok(_) => state.events.finish(activity, Some(0), None),
+        Err(e) => state.events.finish(activity, None, Some(e.to_string())),
+    }
 }
 
 async fn run_script(script: &str, args: &[&str], timeout_secs: u64) -> Result<Page, SidecarError> {
@@ -371,6 +436,10 @@ fn validate_url(url: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Every format, so a new variant cannot quietly skip the shared contracts
+    /// asserted below.
+    const ALL: [Format; 4] = [Format::Markdown, Format::Text, Format::Html, Format::Dom];
+
     #[test]
     fn https_and_http_urls_allowed() {
         assert!(validate_url("https://medium.com/some-article").is_ok());
@@ -421,7 +490,7 @@ mod tests {
 
     #[test]
     fn every_format_maps_to_a_script_returning_the_page_shape() {
-        for format in [Format::Markdown, Format::Text, Format::Html] {
+        for format in ALL {
             for links in [false, true] {
                 let js = format.extract_js(links);
                 assert!(js.contains("JSON.stringify"), "{format:?} must emit JSON");
@@ -461,7 +530,7 @@ mod tests {
     #[test]
     fn only_markdown_reaches_into_the_page_before_extracting() {
         assert_eq!(Format::Markdown.prepare_js(), OPEN_TRANSCRIPT_JS);
-        for format in [Format::Text, Format::Html] {
+        for format in [Format::Text, Format::Html, Format::Dom] {
             assert_eq!(format.prepare_js(), ALREADY_READY_JS);
         }
     }
@@ -470,25 +539,83 @@ mod tests {
     fn every_prepare_step_can_answer_ready() {
         // The AppleScript loop exits on "ready" and otherwise spends its whole
         // budget, so a step with no path to that string would stall the fetch.
-        for format in [Format::Markdown, Format::Text, Format::Html] {
+        for format in ALL {
             assert!(format.prepare_js().contains(r#""ready""#));
         }
     }
 
     #[test]
     fn only_markdown_gets_youtube_handling() {
-        // `text` and `html` are the documented way to read a watch page as a
-        // page; they must stay untouched by the chain.
-        for format in [Format::Text, Format::Html] {
+        // `text`, `html` and `dom` are the documented ways to read a watch page
+        // as a page; they must stay untouched by the chain.
+        for format in [Format::Text, Format::Html, Format::Dom] {
             assert!(!format.extract_js(false).contains("youtube.com"));
         }
     }
 
     #[test]
-    fn include_links_does_not_affect_text_or_html() {
-        for format in [Format::Text, Format::Html] {
+    fn include_links_only_affects_markdown() {
+        for format in [Format::Text, Format::Html, Format::Dom] {
             assert_eq!(format.extract_js(false), format.extract_js(true));
         }
+    }
+
+    #[test]
+    fn dom_format_deserializes_and_captures_html() {
+        let req: FetchRequest = serde_json::from_str(r#"{"url":"https://x.com","format":"dom"}"#)
+            .expect("dom request deserializes");
+        assert!(matches!(req.format, Format::Dom));
+        // Dom is derived from the HTML capture, so it uses the HTML JS.
+        assert_eq!(req.format.extract_js(false), EXTRACT_HTML_JS);
+    }
+
+    #[test]
+    fn dom_finish_converts_captured_html() {
+        let converted = Format::Dom
+            .finish(page("<h1>Title</h1><p>Hello <strong>world</strong></p>"))
+            .expect("conversion succeeds");
+        assert_eq!(converted.url, "https://x.com/");
+        assert_eq!(converted.title, "T");
+        assert!(
+            converted.content.contains("# Title"),
+            "expected a Markdown heading, got: {}",
+            converted.content
+        );
+        assert!(
+            converted.content.contains("**world**"),
+            "expected bold Markdown, got: {}",
+            converted.content
+        );
+    }
+
+    #[test]
+    fn formats_other_than_dom_finish_pass_through() {
+        for format in [Format::Markdown, Format::Text, Format::Html] {
+            assert_eq!(
+                format.finish(page("<p>raw</p>")).unwrap().content,
+                "<p>raw</p>",
+                "{format:?} must not post-process"
+            );
+        }
+    }
+
+    #[test]
+    fn dom_skips_style_and_script_noise() {
+        // A full-document capture carries <head><style>…</style></head> and
+        // inline scripts; neither should leak into the Markdown body.
+        let md = Format::Dom
+            .finish(page(
+                "<html><head><style>body{color:red}</style></head>\
+                 <body><script>alert(1)</script><p>Real content</p></body></html>",
+            ))
+            .unwrap()
+            .content;
+        assert!(md.contains("Real content"), "got: {md}");
+        assert!(!md.contains("color:red"), "CSS leaked into markdown: {md}");
+        assert!(
+            !md.contains("alert(1)"),
+            "script leaked into markdown: {md}"
+        );
     }
 
     fn page(content: &str) -> Page {

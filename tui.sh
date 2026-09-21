@@ -8,8 +8,8 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="${HOME}/.local/bin"
-BINARY="${BIN_DIR}/sidecar-tui"
+# shellcheck source=kill-previous.sh
+source "${REPO_DIR}/kill-previous.sh"
 PROFILE="release"
 CARGO_PROFILE_FLAG="--release"
 PORT=""
@@ -28,19 +28,23 @@ if ! curl -s http://localhost:${PORT:-8765}/health 2>/dev/null | grep -q '"statu
   exit 1
 fi
 
+# Before the build, not after: a stray instance holds the terminal for the whole
+# compile otherwise, and a suspended one keeps the tty open indefinitely — it
+# cannot handle a signal until something resumes it. Only one process group can
+# own the tty, so a leftover TUI reading stdin from the background takes SIGTTIN
+# and suspends, which is what filled the shell with `[1] … [9] suspended` jobs.
+kill_previous sidecar-tui
+
 echo "Building sidecar-tui ($PROFILE)..."
 cd "$REPO_DIR"
 # shellcheck disable=SC2086
 cargo build $CARGO_PROFILE_FLAG --features tui --bin sidecar-tui
 
-mkdir -p "$BIN_DIR"
-cp "target/${PROFILE}/sidecar-tui" "$BINARY"
-echo "Installed → $BINARY"
-echo ""
-
 PORT_FLAG=""
 [[ -n "$PORT" ]] && PORT_FLAG="--port $PORT"
 
+# Run straight from the build directory rather than installing to ~/.local/bin.
+# An endpoint security policy SIGKILLs this binary from there (`Killed: 9` before
+# it executes), while the identical file runs fine from the repo.
 # shellcheck disable=SC2086
-exec "$BINARY" $PORT_FLAG
-
+exec "${REPO_DIR}/target/${PROFILE}/sidecar-tui" $PORT_FLAG

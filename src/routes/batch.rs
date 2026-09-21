@@ -3,15 +3,11 @@ use std::time::Instant;
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::SidecarError,
-    logger,
-    routes::exec::{self, RunSpec},
-    AppState,
-};
+use crate::{error::SidecarError, events::ActivityKind, logger, routes::exec, AppState};
 
-/// One command in a batch. `cwd`, `timeout_secs`, and `env` override the
-/// batch-level defaults for this step only.
+/// One command in a batch. Mirrors the `/exec` request shape (no shell, args as
+/// an explicit vector), with an optional per-step `cwd` that overrides the
+/// batch-level default.
 #[derive(Debug, Deserialize)]
 pub struct BatchStep {
     pub cmd: String,
@@ -23,22 +19,19 @@ pub struct BatchStep {
     pub env: Vec<(String, String)>,
 }
 
-/// `POST /batch` request: an ordered list of commands to run in sequence.
+/// `POST /batch` — an ordered list of commands run in sequence in one call.
 #[derive(Debug, Deserialize)]
 pub struct BatchRequest {
     pub steps: Vec<BatchStep>,
-    /// Default working directory for steps that don't set their own.
+    /// Working directory applied to every step that does not set its own `cwd`.
     pub cwd: Option<String>,
-    /// Default per-step timeout in seconds (default 60). Applies to each step
-    /// individually — it is not a budget for the batch as a whole.
-    pub timeout_secs: Option<u64>,
-    /// Env applied to every step. A step's own `env` wins on key collisions.
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-    /// When false (default), stop at the first step that exits nonzero. When
-    /// true, run every step regardless of exit codes.
+    /// When true, keep running after a step fails (non-zero exit or spawn/timeout
+    /// error). Default: stop at the first failure.
     #[serde(default)]
     pub continue_on_error: bool,
+    /// Claude Code session on whose behalf the batch runs. Applied to every step,
+    /// since a batch is one caller's request. See [`super::exec::ExecRequest`].
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,111 +41,110 @@ pub struct BatchStepResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    /// Present only when the step failed to run at all (timeout, spawn error)
+    /// rather than exiting with a code. `exit_code` is `-1` in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BatchResponse {
-    /// Results for the steps that actually ran, in order. Shorter than the
-    /// request's `steps` if the batch stopped early on a failure.
     pub steps: Vec<BatchStepResult>,
-    /// Index (into the request's `steps`) of the first step that exited
-    /// nonzero, if any.
-    pub failed_at: Option<usize>,
-    /// True when every requested step ran and all exited zero.
-    pub success: bool,
+    /// True when execution stopped early because a step failed and
+    /// `continue_on_error` was not set. The `steps` array then holds only the
+    /// steps that actually ran.
+    pub aborted: bool,
 }
 
-/// Upper bound on steps per batch — a sanity guard, not a security control.
-const MAX_STEPS: usize = 100;
-
-/// `POST /batch` — run an ordered sequence of allowlisted commands, stopping at
-/// the first failure unless `continue_on_error` is set.
+/// `POST /batch` — validate every step against the allowlist up front, then run
+/// them in order, stopping at the first failure unless `continue_on_error`.
 ///
-/// Every step is validated against the allowlist *before any step runs*, so a
-/// disallowed command anywhere in the sequence rejects the whole batch (403)
-/// without executing side effects. This is stricter than running until the bad
-/// step is reached, and keeps a partially-applied batch from happening because
-/// of a typo'd command name.
+/// There is deliberately no value substitution between steps and no shell: each
+/// step goes through exactly the same allowlist + argument gate as `/exec`. If
+/// step 2 needs a value produced by step 1, read it from the response and build
+/// step 2 explicitly in a second call.
 pub async fn handle(
     State(state): State<AppState>,
     Json(req): Json<BatchRequest>,
 ) -> Result<Json<BatchResponse>, SidecarError> {
     if req.steps.is_empty() {
-        return Err(SidecarError::InvalidRequest("`steps` is empty".into()));
-    }
-    if req.steps.len() > MAX_STEPS {
-        return Err(SidecarError::InvalidRequest(format!(
-            "too many steps ({}); max {MAX_STEPS}",
-            req.steps.len()
-        )));
+        return Err(SidecarError::InvalidRequest(
+            "batch requires at least one step".into(),
+        ));
     }
 
-    // Pre-validate every step so a bad command name fails the whole batch
-    // before we run anything side-effecting.
+    // Pre-flight: validate the whole batch before running anything, so a
+    // disallowed step never executes after side-effecting steps have already
+    // run. A single bad step fails the entire request with 403.
     for step in &req.steps {
         exec::validate(&step.cmd, &step.args)?;
     }
 
-    let default_timeout = req.timeout_secs.unwrap_or(60);
-    logger::log_request(
-        "POST",
-        "/batch",
-        &format!("{} steps", req.steps.len()),
-        &[],
-        req.cwd.as_deref(),
-    );
-    let started = Instant::now();
-
+    let verbose = state.config.verbose;
     let mut results = Vec::with_capacity(req.steps.len());
-    let mut failed_at = None;
+    let mut aborted = false;
+    // Blank is treated as absent, as on `/exec`.
+    let session = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
-    for (idx, step) in req.steps.iter().enumerate() {
+    for step in &req.steps {
         let cwd = step.cwd.as_deref().or(req.cwd.as_deref());
-        let timeout_secs = step.timeout_secs.unwrap_or(default_timeout);
-        // Batch env first, then step env — Command applies later keys last, so
-        // a step's own env overrides the batch default on collision.
-        let mut env = req.env.clone();
-        env.extend(step.env.iter().cloned());
-
+        let timeout_secs = step.timeout_secs.unwrap_or(60);
         logger::log_request("POST", "/batch", &step.cmd, &step.args, cwd);
-
-        let out = exec::run_command(RunSpec {
-            cmd: &step.cmd,
-            args: &step.args,
+        let started = Instant::now();
+        // Per step, not per batch: a step is what runs and what fails, and a
+        // batch-level record would hide which one is currently executing.
+        let activity = state.events.start_for_session(
+            ActivityKind::Batch,
+            &step.cmd,
+            &step.args,
             cwd,
-            env: &env,
-            timeout_secs,
-            verbose: state.config.verbose,
-        })
-        .await?;
+            session,
+        );
 
-        let exit_code = out.exit_code;
-        results.push(BatchStepResult {
-            cmd: step.cmd.clone(),
-            args: step.args.clone(),
-            stdout: out.stdout,
-            stderr: out.stderr,
-            exit_code,
-        });
+        let outcome =
+            exec::run_command(&step.cmd, &step.args, cwd, timeout_secs, &step.env, verbose).await;
 
-        if exit_code != 0 && failed_at.is_none() {
-            failed_at = Some(idx);
-            if !req.continue_on_error {
-                break;
+        let result = match outcome {
+            Ok(r) => {
+                logger::log_completion("/batch", Some(r.exit_code), started.elapsed().as_millis());
+                state.events.finish(activity, Some(r.exit_code), None);
+                BatchStepResult {
+                    cmd: step.cmd.clone(),
+                    args: step.args.clone(),
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                    exit_code: r.exit_code,
+                    error: None,
+                }
             }
+            Err(e) => {
+                logger::log_completion("/batch", None, started.elapsed().as_millis());
+                state.events.finish(activity, None, Some(e.to_string()));
+                BatchStepResult {
+                    cmd: step.cmd.clone(),
+                    args: step.args.clone(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: -1,
+                    error: Some(e.to_string()),
+                }
+            }
+        };
+
+        let failed = result.exit_code != 0 || result.error.is_some();
+        results.push(result);
+        if failed && !req.continue_on_error {
+            aborted = true;
+            break;
         }
     }
 
-    let success = failed_at.is_none();
-    logger::log_completion(
-        "/batch",
-        Some(if success { 0 } else { 1 }),
-        started.elapsed().as_millis(),
-    );
-
     Ok(Json(BatchResponse {
         steps: results,
-        failed_at,
-        success,
+        aborted,
     }))
 }

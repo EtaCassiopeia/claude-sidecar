@@ -19,6 +19,9 @@ pub enum SidecarError {
     #[error("browser bridge failed: {0}")]
     Browser(String),
 
+    #[error("clipboard load failed: {0}")]
+    Clipboard(String),
+
     #[error("command not found on PATH: {0}")]
     CommandNotFound(String),
 
@@ -49,7 +52,7 @@ impl SidecarError {
         match self {
             SidecarError::NotAllowed(_) => StatusCode::FORBIDDEN,
             SidecarError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-            SidecarError::Browser(_) => StatusCode::BAD_GATEWAY,
+            SidecarError::Browser(_) | SidecarError::Clipboard(_) => StatusCode::BAD_GATEWAY,
             SidecarError::CommandNotFound(_) | SidecarError::JobNotFound(_) => {
                 StatusCode::NOT_FOUND
             }
