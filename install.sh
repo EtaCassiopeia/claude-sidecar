@@ -69,7 +69,15 @@ bash "${REPO_DIR}/check-auth.sh" || true  # non-fatal: installation continues re
 step "Building claude-sidecar"
 cd "$REPO_DIR"
 cargo build --release
-cp target/release/claude-sidecar "$BINARY"
+# Install via a temp file plus an atomic rename, never a straight `cp` onto
+# "$BINARY". Overwriting a Mach-O in place while a copy of it is still running
+# rewrites the pages that process has mapped, which invalidates the binary's
+# code signature — macOS then SIGKILLs the *newly installed* binary on its next
+# exec (observed: `claude-sidecar --version` dying with 137 right after the cp).
+# `mv` onto the path allocates a new inode, so the running process keeps the old
+# one until it is stopped and the new file is untouched.
+cp target/release/claude-sidecar "${BINARY}.new"
+mv -f "${BINARY}.new" "$BINARY"
 green "  built → $BINARY"
 
 # ── 4. PATH ───────────────────────────────────────────────────────────────────
