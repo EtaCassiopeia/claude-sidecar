@@ -254,7 +254,15 @@ async fn run(
                     log_cancel.cancel();
                     break;
                 }
+                let toggled_stats = matches!(action, Action::ToggleStats);
                 app.update(action);
+                // Load on open, and only on open. Nothing else consumes the
+                // summary, so fetching it on the reconcile ticker would scan the
+                // metrics archive every few seconds to feed a panel that is
+                // closed almost all the time.
+                if toggled_stats && app.show_stats {
+                    spawn_stats_fetch(&tx, &client, &cancel);
+                }
             }
         }
     }
@@ -288,6 +296,31 @@ fn spawn_refresh(
                         break;
                     }
                 }
+            }
+        }
+    });
+}
+
+/// Fetch the metrics summary once, for a freshly opened stats overlay.
+///
+/// One shot rather than a ticker: see the call site. A failure becomes
+/// `StatsFailed` so the panel says why it is empty — a metrics-disabled sidecar
+/// is the common case, and silence there reads as a broken overlay.
+fn spawn_stats_fetch(
+    tx: &mpsc::UnboundedSender<Action>,
+    client: &SidecarClient,
+    cancel: &CancellationToken,
+) {
+    let (tx, client, cancel) = (tx.clone(), client.clone(), cancel.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            result = client.stats() => {
+                let action = match result {
+                    Ok(snapshot) => Action::StatsLoaded(Box::new(snapshot)),
+                    Err(e) => Action::StatsFailed(e.to_string()),
+                };
+                let _ = tx.send(action);
             }
         }
     });
@@ -417,6 +450,7 @@ enum Overlay {
     None,
     Help,
     Errors,
+    Stats,
 }
 
 impl Overlay {
@@ -426,18 +460,21 @@ impl Overlay {
         match v {
             1 => Self::Help,
             2 => Self::Errors,
+            3 => Self::Stats,
             _ => Self::None,
         }
     }
 }
 
-/// The overlay `app` is currently showing. Help wins if somehow both are set,
-/// matching the render order.
+/// The overlay `app` is currently showing. Ties break the same way the renderer
+/// stacks them, so the keys always belong to the panel actually on screen.
 fn current_overlay(app: &App) -> Overlay {
     if app.show_help {
         Overlay::Help
     } else if app.show_errors {
         Overlay::Errors
+    } else if app.show_stats {
+        Overlay::Stats
     } else {
         Overlay::None
     }
@@ -478,6 +515,7 @@ fn map_event(event: Event, typing: bool, overlay: Overlay) -> Option<Action> {
     if overlay != Overlay::None {
         let (scroll, close): (fn(i16) -> Action, Action) = match overlay {
             Overlay::Errors => (Action::ErrorScroll, Action::ToggleErrors),
+            Overlay::Stats => (Action::StatsScroll, Action::ToggleStats),
             _ => (Action::HelpScroll, Action::ToggleHelp),
         };
         return match key.code {
@@ -543,6 +581,7 @@ fn map_event(event: Event, typing: bool, overlay: Overlay) -> Option<Action> {
 
         KeyCode::Char('?') => Some(Action::ToggleHelp),
         KeyCode::Char('e') if plain => Some(Action::ToggleErrors),
+        KeyCode::Char('s') if plain => Some(Action::ToggleStats),
         KeyCode::Esc => Some(Action::SearchCancel),
         // `/` with a query already set reopens the field to edit it.
         _ => None,
@@ -775,6 +814,67 @@ mod tests {
         assert!(matches!(
             map_event(key(KeyCode::Char('q')), false, Overlay::Errors),
             Some(Action::Quit)
+        ));
+    }
+
+    /// Regression: every layer of the stats overlay existed — the action, the
+    /// app state, the renderer, the HTTP client — except a key that reached it,
+    /// so the footer advertised `s` and `s` did nothing.
+    #[test]
+    fn s_opens_the_stats_overlay() {
+        assert!(matches!(
+            map(key(KeyCode::Char('s')), false, false),
+            Some(Action::ToggleStats)
+        ));
+    }
+
+    /// The stats panel must scroll *itself* and close *itself*. Before
+    /// `Overlay::Stats` existed these fell through to the help arm, which
+    /// scrolled the wrong offset and toggled the wrong flag — leaving the panel
+    /// on screen and unscrollable.
+    #[test]
+    fn the_stats_overlay_scrolls_and_closes_itself() {
+        let up = map_event(key(KeyCode::Up), false, Overlay::Stats);
+        assert!(
+            matches!(up, Some(Action::StatsScroll(d)) if d < 0),
+            "arrows must scroll the stats panel, got {up:?}"
+        );
+        let down = map_event(key(KeyCode::Char('j')), false, Overlay::Stats);
+        assert!(
+            matches!(down, Some(Action::StatsScroll(d)) if d > 0),
+            "j must scroll down, got {down:?}"
+        );
+        assert!(matches!(
+            map_event(key(KeyCode::Char('x')), false, Overlay::Stats),
+            Some(Action::ToggleStats)
+        ));
+        // Quitting must still work, or the panel is a trap.
+        assert!(matches!(
+            map_event(key(KeyCode::Char('q')), false, Overlay::Stats),
+            Some(Action::Quit)
+        ));
+    }
+
+    /// The input task learns which overlay is up through a published `u8`, so a
+    /// variant that does not survive that round trip silently routes the panel's
+    /// keys to the job list underneath it.
+    #[test]
+    fn stats_overlay_survives_the_u8_round_trip() {
+        assert_eq!(Overlay::from_u8(Overlay::Stats as u8), Overlay::Stats);
+        let mut app = App::new();
+        app.update(Action::ToggleStats);
+        assert_eq!(current_overlay(&app), Overlay::Stats);
+        app.update(Action::ToggleStats);
+        assert_eq!(current_overlay(&app), Overlay::None);
+    }
+
+    /// `s` is a command, not query text — searching for "sbt" must not open a
+    /// panel mid-word.
+    #[test]
+    fn s_is_query_text_while_typing() {
+        assert!(matches!(
+            map(key(KeyCode::Char('s')), true, false),
+            Some(Action::SearchInput('s'))
         ));
     }
 
