@@ -31,6 +31,7 @@ tui = [
     "dep:futures",
     "dep:tokio-util",
     "dep:color-eyre",
+    "dep:regex",
 ]
 
 [dependencies]
@@ -50,9 +51,49 @@ libc = "0.2"
 # is shared between the history vec and live broadcast).
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+# Command policy config file.
+toml = "0.8"
 
 # Job IDs.
 uuid = { version = "1", features = ["v4"] }
+
+# HTML → Markdown for the browser bridge's `format: "markdown"` mode. Turndown-
+# style converter with pure-Rust deps (Servo's html5ever), no C toolchain.
+htmd = "0.5"
+
+# Markdown → Google-Docs-pasteable HTML (`/gdocs/clipboard`). `default-features
+# = false` drops pulldown-cmark's own HTML writer, which we can't use: Docs
+# ignores <style> blocks, so we emit inline style attributes from the event
+# stream instead. `regex-fancy` (not the default `regex-onig`) keeps this a
+# pure-Rust build — onig needs a C toolchain.
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5.3", default-features = false, features = [
+    "parsing",
+    "html",
+    "dump-load",
+    "regex-fancy",
+] }
+# Bundles bat's grammar set — the reason we can highlight Scala at all, which
+# syntect's own defaults don't cover.
+two-face = { version = "0.5", default-features = false, features = [
+    "syntect-fancy",
+] }
+# Diagrams and images travel to Docs as base64 data URIs.
+base64 = "0.22"
+
+# Durable call metrics: Parquet storage plus an in-process SQL engine, so
+# `claude-sidecar query` needs no external tool. `arrow` and `parquet` are
+# deliberately NOT declared separately — datafusion re-exports both
+# (`datafusion::arrow`, `datafusion::parquet`), and naming them here resolved a
+# second, incompatible major version of arrow into the tree alongside
+# datafusion's own. Default features are off to drop the ones this never uses
+# (avro, csv-as-a-first-class-source, crypto/encoding expression packs).
+datafusion = { version = "55", default-features = false, features = [
+    "parquet",
+    "sql",
+    "datetime_expressions",
+    "unicode_expressions",
+] }
 
 # Logging.
 tracing = "0.1"
@@ -70,6 +111,8 @@ ratatui             = { version = "0.30", optional = true }
 crossterm           = { version = "0.29", optional = true, features = ["event-stream"] }
 reqwest             = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream"] }
 reqwest-eventsource = { version = "0.6", optional = true }
+# Already in the tree via syntect, so enabling it here adds no new dependency.
+regex               = { version = "1", optional = true }
 futures             = { version = "0.3", optional = true }
 tokio-util          = { version = "0.7", optional = true }
 color-eyre          = { version = "0.6", optional = true }
@@ -81,7 +124,13 @@ http-body-util = "0.1"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# Thin LTO and parallel codegen units, not `lto = true` + `codegen-units = 1`.
+# Fat LTO holds the whole dependency graph's IR in one rustc process, which the
+# DataFusion crates are large enough to push past available RAM — the release
+# build died with SIGKILL (the OOM killer) in datafusion-datasource, not a
+# compile error. Thin LTO optimizes across crates incrementally and gets most of
+# the benefit; the binary is stripped anyway, and this is a local dev tool whose
+# bottleneck is process spawning, not codegen.
+lto = "thin"
+codegen-units = 16
 strip = true
-

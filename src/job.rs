@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
         Arc, PoisonError, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -29,7 +29,7 @@ pub fn now_ms() -> u64 {
 /// Recover a lock guard even if a previous holder panicked. We never hold these
 /// guards across an `.await` and never panic while holding one, so poisoning is
 /// not expected — but recovering keeps a stray panic from cascading into 500s.
-fn recover<T>(result: Result<T, PoisonError<T>>) -> T {
+pub(crate) fn recover<T>(result: Result<T, PoisonError<T>>) -> T {
     result.unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -299,9 +299,19 @@ pub enum Outcome {
     Completed {
         exit_code: i32,
     },
-    TimedOut,
+    /// Wall-clock timeout. `escalated` means the process ignored `SIGTERM` and
+    /// had to be `SIGKILL`ed, so it did not get to clean up after itself.
+    TimedOut {
+        escalated: bool,
+    },
     /// Canceled via DELETE /jobs/:id before the process finished naturally.
-    Canceled,
+    Canceled {
+        escalated: bool,
+    },
+    /// Killed for producing no output for longer than its idle timeout.
+    IdleTimedOut {
+        escalated: bool,
+    },
     /// The process could not be spawned or the runner failed internally.
     Failed,
 }
@@ -368,6 +378,10 @@ pub struct Job {
     pub id: JobId,
     pub cmd: String,
     pub args: Vec<String>,
+    /// Which client asked for this job — a Claude Code session id when the caller
+    /// supplied one. Several sessions share one sidecar, so the pid in the logs
+    /// cannot tell them apart; this can.
+    pub session_id: Option<String>,
     pub started_at: Instant,
     /// Live event fan-out. Kept alive for the job's lifetime.
     events: broadcast::Sender<JobEvent>,
@@ -375,9 +389,21 @@ pub struct Job {
     lines: RwLock<LineBuffer>,
     state: RwLock<JobState>,
     /// Registered by `pty::run` once the child PID is known; called by `cancel`.
-    kill_fn: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Returns whether a signal was actually delivered.
+    #[allow(clippy::type_complexity)]
+    kill_fn: RwLock<Option<Box<dyn Fn() -> bool + Send + Sync>>>,
     /// Set when `cancel()` is called so the runner task can detect it.
     canceled: AtomicBool,
+    /// Unix-ms of the most recent output. An atomic rather than a lock because
+    /// `push_line` is the highest-frequency write in the system.
+    ///
+    /// Updated on any received segment, not only on emitted lines: a progress
+    /// bar redrawing in place produces no new line (see `pty::LineAssembler`) but
+    /// is unambiguous evidence of progress, and treating it as idle would kill
+    /// live jobs.
+    last_output_ms: AtomicU64,
+    /// Child PID once spawned, for users who need to inspect a wedged job.
+    pid: AtomicI32,
 }
 
 impl Job {
@@ -385,6 +411,7 @@ impl Job {
         id: JobId,
         cmd: String,
         args: Vec<String>,
+        session_id: Option<String>,
         max_lines: usize,
         spill_path: Option<PathBuf>,
     ) -> Arc<Self> {
@@ -393,21 +420,57 @@ impl Job {
             id,
             cmd,
             args,
+            session_id,
             started_at: Instant::now(),
             events,
             lines: RwLock::new(LineBuffer::new(max_lines, spill_path)),
             state: RwLock::new(JobState::Running),
             kill_fn: RwLock::new(None),
             canceled: AtomicBool::new(false),
+            last_output_ms: AtomicU64::new(now_ms()),
+            pid: AtomicI32::new(0),
         })
+    }
+
+    /// A standalone job for tests that need to drive a runner without a registry.
+    #[cfg(test)]
+    pub fn new_for_test(id: &str, max_lines: usize) -> Arc<Self> {
+        Self::new(id.to_string(), "test".into(), vec![], None, max_lines, None)
     }
 
     /// Append a line and broadcast it. Single write-lock — the logical index is
     /// assigned under that same lock, so it cannot race.
     pub fn push_line(&self, text: String) {
+        self.mark_output();
         let line = recover(self.lines.write()).push(text);
         // No subscribers is fine.
         let _ = self.events.send(JobEvent::Line(line));
+    }
+
+    /// Record that the child produced output just now, without storing a line.
+    ///
+    /// The runner calls this for in-place redraws too, so idle detection tracks
+    /// *activity* rather than line count.
+    pub fn mark_output(&self) {
+        self.last_output_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last output, or since start if there has been none.
+    pub fn idle_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.last_output_ms.load(Ordering::Relaxed))
+    }
+
+    /// Publish the child's PID once known.
+    pub fn set_pid(&self, pid: i32) {
+        self.pid.store(pid, Ordering::Relaxed);
+    }
+
+    /// The child's PID, or `None` before spawn.
+    pub fn pid(&self) -> Option<i32> {
+        match self.pid.load(Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
     }
 
     /// Transition to a terminal state and broadcast the outcome. Idempotent:
@@ -482,19 +545,24 @@ impl Job {
 
     /// Register a kill callback (called by `pty::run` once the child PID is
     /// known). Stored as a type-erased fn so `job.rs` doesn't depend on `pty.rs`.
-    pub fn arm_kill<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+    /// The callback reports whether a signal was actually delivered.
+    pub fn arm_kill<F: Fn() -> bool + Send + Sync + 'static>(&self, f: F) {
         *recover(self.kill_fn.write()) = Some(Box::new(f));
     }
 
     /// Signal the job's process group with SIGKILL and mark it as canceled.
-    /// No-op if the job has already finished.
-    pub fn cancel(&self) {
+    ///
+    /// Returns whether a signal was actually delivered. `false` means either the
+    /// job had already finished or the child had not been spawned yet — callers
+    /// must not report a cancel as effective on the strength of intent alone.
+    pub fn cancel(&self) -> bool {
         if !self.state().is_running() {
-            return;
+            return false;
         }
         self.canceled.store(true, Ordering::SeqCst);
-        if let Some(f) = recover(self.kill_fn.read()).as_ref() {
-            f();
+        match recover(self.kill_fn.read()).as_ref() {
+            Some(f) => f(),
+            None => false,
         }
     }
 
@@ -551,7 +619,12 @@ impl JobRegistry {
         }
     }
 
-    pub fn create(&self, cmd: String, args: Vec<String>) -> Result<Arc<Job>, SidecarError> {
+    pub fn create(
+        &self,
+        cmd: String,
+        args: Vec<String>,
+        session_id: Option<String>,
+    ) -> Result<Arc<Job>, SidecarError> {
         let mut jobs = recover(self.jobs.write());
         if jobs.len() >= self.max_jobs {
             return Err(SidecarError::TooManyJobs { max: self.max_jobs });
@@ -561,7 +634,14 @@ impl JobRegistry {
             .spill_dir
             .as_ref()
             .map(|dir| dir.join(format!("{id}.jsonl")));
-        let job = Job::new(id.clone(), cmd, args, self.max_lines, spill_path);
+        let job = Job::new(
+            id.clone(),
+            cmd,
+            args,
+            session_id,
+            self.max_lines,
+            spill_path,
+        );
         jobs.insert(id, Arc::clone(&job));
         Ok(job)
     }
@@ -581,6 +661,25 @@ impl JobRegistry {
         recover(self.jobs.read()).values().cloned().collect()
     }
 
+    /// Force a terminal state on jobs whose runner is gone.
+    ///
+    /// Backstop for the case the per-job supervision cannot cover: if the runner
+    /// task is aborted (runtime shutdown) rather than panicking, nothing calls
+    /// `finish`, and a job left in `Running` is never evicted — it holds a
+    /// `max_jobs` slot for the life of the process and reports as live forever.
+    /// A running job whose `Arc` is held only by this registry has no runner.
+    fn reap_orphans(self: &Arc<Self>) {
+        for job in self.snapshot() {
+            // 2 = the registry map + our snapshot clone. Any runner would hold a
+            // third. Checked before `is_running` so a job finishing concurrently
+            // is simply skipped on this pass.
+            if Arc::strong_count(&job) <= 2 && job.state().is_running() {
+                tracing::error!(job_id = %job.id, "job runner vanished; marking failed");
+                job.finish(Outcome::Failed);
+            }
+        }
+    }
+
     fn evict_expired(&self) {
         let mut jobs = recover(self.jobs.write());
         jobs.retain(|id, job| match job.state().finished_at() {
@@ -598,6 +697,7 @@ impl JobRegistry {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             loop {
                 ticker.tick().await;
+                self.reap_orphans();
                 self.evict_expired();
             }
         });
@@ -611,7 +711,7 @@ mod tests {
     const UNBOUNDED: usize = 100_000;
 
     fn job(cap: usize, spill_path: Option<PathBuf>) -> Arc<Job> {
-        Job::new("j".into(), "cargo".into(), vec![], cap, spill_path)
+        Job::new("j".into(), "cargo".into(), vec![], None, cap, spill_path)
     }
 
     #[tokio::test]
@@ -718,7 +818,7 @@ mod tests {
         let job = job(UNBOUNDED, None);
         assert!(job.state().is_running());
         job.finish(Outcome::Completed { exit_code: 0 });
-        job.finish(Outcome::TimedOut); // ignored
+        job.finish(Outcome::TimedOut { escalated: true }); // ignored
         assert_eq!(job.state().outcome().and_then(Outcome::exit_code), Some(0));
         assert!(!job.state().is_running());
     }
@@ -726,8 +826,8 @@ mod tests {
     #[test]
     fn registry_enforces_max_jobs() {
         let reg = JobRegistry::new(1, UNBOUNDED, false, 600);
-        assert!(reg.create("cargo".into(), vec![]).is_ok());
-        match reg.create("cargo".into(), vec![]) {
+        assert!(reg.create("cargo".into(), vec![], None).is_ok());
+        match reg.create("cargo".into(), vec![], None) {
             Err(SidecarError::TooManyJobs { max }) => assert_eq!(max, 1),
             _ => panic!("expected TooManyJobs error when at capacity"),
         }

@@ -1,0 +1,20 @@
+# claude-sidecar command policy
+#
+# Copy to ~/.config/claude-sidecar/config.toml (or point $SIDECAR_CONFIG here).
+# The sidecar runs fine without this file — it falls back to the defaults below.
+#
+# Model: deny-by-exception. Every command is permitted except those named here.
+#
+# This is not a containment boundary. The sidecar runs as you, on your machine,
+# so anything that can reach it can already run code as you — and most denials
+# are trivially reachable through an exec wrapper anyway (`env openssl`,
+# `xargs openssl`, a shell script, a build tool's own hooks). The denylist is
+# for making a deliberate refusal loud, not for containing a hostile caller.
+#
+# Matching is on the command basename, so `sudo` also refuses `/usr/bin/sudo`.
+#
+# Present-but-empty (`denied = []`) means deny nothing. Omitting the key
+# entirely keeps the built-in default. A syntax error here aborts startup rather
+# than silently reverting to defaults.
+
+denied = ["sudo"]

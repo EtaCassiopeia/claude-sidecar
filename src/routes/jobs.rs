@@ -16,7 +16,7 @@ use crate::{
     config,
     error::SidecarError,
     job::{now_ms, JobEvent, JobLine, Outcome},
-    logger,
+    logger, metrics,
     pty::{self, PtyOptions},
     AppState,
 };
@@ -33,21 +33,14 @@ const DEFAULT_ROWS: u16 = 50;
 
 /// Return a summary of every tracked job (running and recently finished).
 pub async fn list(State(state): State<AppState>) -> Json<Vec<StatusResponse>> {
-    let jobs = state.registry.snapshot();
-    let mut summaries = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let job_state = job.state();
-        summaries.push(StatusResponse {
-            job_id: job.id.clone(),
-            cmd: job.cmd.clone(),
-            args: job.args.clone(),
-            running: job_state.is_running(),
-            exit_code: job_state.outcome().and_then(Outcome::exit_code),
-            line_count: job.line_count(),
-            elapsed_ms: job.elapsed_ms(),
-        });
-    }
-    Json(summaries)
+    Json(
+        state
+            .registry
+            .snapshot()
+            .iter()
+            .map(|j| summarize(j))
+            .collect(),
+    )
 }
 
 // ─── POST /jobs ───────────────────────────────────────────────────────────────
@@ -59,6 +52,16 @@ pub struct CreateJobRequest {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub timeout_secs: Option<u64>,
+    /// Kill the job if it emits nothing for this long. Off unless set — a quiet
+    /// job (long link step, silent test run) is not necessarily a wedged one.
+    pub idle_timeout_secs: Option<u64>,
+    /// Keystrokes to feed the command's stdin up front, for tools that stop on a
+    /// confirmation prompt (`"Y\n"`). Omitted means stdin is closed.
+    pub input: Option<String>,
+    /// Identifies the calling client so a monitor can group jobs by origin. The
+    /// sidecar never interprets it — an opaque tag, typically a Claude Code
+    /// session id supplied by a hook.
+    pub session_id: Option<String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     #[serde(default)]
@@ -76,18 +79,20 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<Json<CreateJobResponse>, SidecarError> {
-    if !config::is_allowed(&req.cmd) {
-        return Err(SidecarError::NotAllowed(req.cmd));
-    }
-    if let Err(reason) = config::check_args(&req.cmd, &req.args) {
-        return Err(SidecarError::NotAllowed(reason));
-    }
+    super::exec::validate(&req.cmd, &req.args)?;
     let resolved =
         config::resolve(&req.cmd).ok_or_else(|| SidecarError::CommandNotFound(req.cmd.clone()))?;
 
     logger::log_request("POST", "/jobs", &req.cmd, &req.args, req.cwd.as_deref());
 
-    let job = state.registry.create(req.cmd.clone(), req.args.clone())?;
+    let job = state.registry.create(
+        req.cmd.clone(),
+        req.args.clone(),
+        req.session_id.filter(|s| !s.trim().is_empty()),
+    )?;
+
+    // Captured before `req.args` is moved into `opts` below.
+    let metrics_args = req.args.clone();
 
     let opts = PtyOptions {
         cmd: resolved.to_string_lossy().into_owned(),
@@ -97,28 +102,81 @@ pub async fn create(
         cols: req.cols.unwrap_or(DEFAULT_COLS),
         rows: req.rows.unwrap_or(DEFAULT_ROWS),
         timeout: Duration::from_secs(req.timeout_secs.unwrap_or(DEFAULT_JOB_TIMEOUT_SECS)),
+        kill_grace: Duration::from_secs(state.config.kill_grace_secs),
+        idle_timeout: req
+            .idle_timeout_secs
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs),
+        input: req.input,
         verbose: state.config.verbose,
     };
 
     let job_id = job.id.clone();
     let log_path = format!("/jobs/{job_id}");
     let runner = Arc::clone(&job);
+    // Jobs never pass through `EventBus::finish`, so without this the durable
+    // metrics would omit exactly the slow work most worth measuring — a build
+    // that takes minutes rather than an `/exec` that takes milliseconds.
+    let metrics = state.metrics.clone();
+    let metrics_cmd = req.cmd.clone();
+    let metrics_sub = metrics_args
+        .first()
+        .and_then(|a| metrics::safe_subcommand(a));
+    let metrics_nargs = metrics_args.len() as u32;
+    // Read back off the job rather than off `req`: the registry already applied
+    // the blank-is-absent rule, so this cannot disagree with what the TUI shows.
+    let metrics_session = job.session_id.clone();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let outcome = pty::run(Arc::clone(&runner), opts).await;
-        // If the job was canceled via DELETE /jobs/:id, report Canceled regardless
-        // of what the underlying process returned (likely SIGKILL -> Failed/Completed(-1)).
-        let outcome = if runner.was_canceled() {
-            Outcome::Canceled
-        } else {
-            outcome
+        // Wall-clock start, for the metrics row. `Instant` is monotonic and has
+        // no epoch, so it cannot answer "which day did this run on" — and a long
+        // build started before midnight must be attributed to the day it began,
+        // not the day it finished.
+        let started_ms = now_ms() as i64;
+
+        // Run the pty inside a task we can join, so a panic in it cannot leave
+        // the job Running forever — `finish` is only reachable from here, and a
+        // job stuck in Running is never evicted and holds a slot for good.
+        let pty_job = Arc::clone(&runner);
+        let outcome = match tokio::spawn(pty::run(pty_job, opts)).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!(job_id = %runner.id, "job runner died: {e}");
+                Outcome::Failed
+            }
         };
+
+        // `pty::run` already reports Canceled (with whether the shutdown had to
+        // escalate), so nothing to reinterpret here.
         runner.finish(outcome);
-        logger::log_completion(
-            &log_path,
-            outcome.exit_code(),
-            started.elapsed().as_millis(),
-        );
+        let elapsed = started.elapsed().as_millis();
+        logger::log_completion(&log_path, outcome.exit_code(), elapsed);
+
+        if let Some(recorder) = metrics {
+            recorder.record(&metrics::CallRecord {
+                date: metrics::local_date(started_ms),
+                ts: started_ms,
+                kind: "job".into(),
+                cmd: metrics_cmd,
+                sub: metrics_sub,
+                nargs: metrics_nargs,
+                ms: Some(elapsed as i64),
+                exit: outcome.exit_code(),
+                // A job that was killed or timed out has no exit code, so the
+                // outcome is the only truthful thing to record about it. Named
+                // explicitly rather than via `Debug`, whose struct-variant form
+                // ("canceled { escalated: false }") would leak Rust syntax into
+                // a data column that SQL has to group on.
+                error: match outcome {
+                    Outcome::Completed { .. } => None,
+                    Outcome::Canceled { .. } => Some("canceled".into()),
+                    Outcome::TimedOut { .. } => Some("timed_out".into()),
+                    Outcome::IdleTimedOut { .. } => Some("idle_timed_out".into()),
+                    Outcome::Failed => Some("failed".into()),
+                },
+                session: metrics_session,
+            });
+        }
     });
 
     Ok(Json(CreateJobResponse { job_id }))
@@ -130,7 +188,16 @@ pub async fn create(
 pub struct LinesQuery {
     #[serde(default)]
     pub from: usize,
+    /// Wait up to this many milliseconds for output rather than returning an
+    /// empty window immediately. Capped at [`MAX_WAIT_MS`]; `0` (the default)
+    /// preserves the original non-blocking behavior.
+    #[serde(default)]
+    pub wait_ms: u64,
 }
+
+/// Ceiling on `wait_ms`. Long enough to make polling cheap, short enough to stay
+/// under a client's default HTTP timeout.
+const MAX_WAIT_MS: u64 = 30_000;
 
 #[derive(Debug, Serialize)]
 pub struct LinesResponse {
@@ -145,13 +212,48 @@ pub struct LinesResponse {
 }
 
 /// Return buffered lines starting at `?from=N`, plus the cursor to poll next.
+///
+/// With `?wait_ms=N` the request blocks until output arrives or the job ends,
+/// instead of returning an empty window that the client must re-poll after a
+/// sleep. This is what lets callers drop the fixed `sleep` from their poll loop:
+/// the wait happens here, where it can end the instant something happens.
 pub async fn lines(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<LinesQuery>,
 ) -> Result<Json<LinesResponse>, SidecarError> {
     let job = state.registry.get(&id)?;
-    let (lines, next_from, dropped) = job.read_window(query.from, MAX_LINES_PER_POLL).await;
+
+    // Subscribe before the first read, so a line landing between the read and
+    // the wait cannot be missed. Same ordering discipline as `stream`.
+    let mut rx = job.subscribe();
+    let mut snapshot = job.read_window(query.from, MAX_LINES_PER_POLL).await;
+
+    let wait = Duration::from_millis(query.wait_ms.min(MAX_WAIT_MS));
+    if snapshot.0.is_empty() && !wait.is_zero() && job.state().is_running() {
+        // Wake on any event: a new line, or the job finishing. Lag is not an
+        // error here — the line buffer is authoritative, so a lagged receiver
+        // just means "something happened, go look".
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(JobEvent::Line(_)) | Err(RecvError::Lagged(_))) => {
+                    snapshot = job.read_window(query.from, MAX_LINES_PER_POLL).await;
+                    if !snapshot.0.is_empty() {
+                        break;
+                    }
+                }
+                // Finished, channel closed, or budget spent: re-read once so the
+                // response carries any final lines alongside the terminal state.
+                Ok(Ok(JobEvent::Finished(_)) | Err(RecvError::Closed)) | Err(_) => {
+                    snapshot = job.read_window(query.from, MAX_LINES_PER_POLL).await;
+                    break;
+                }
+            }
+        }
+    }
+
+    let (lines, next_from, dropped) = snapshot;
     let state = job.state();
     Ok(Json(LinesResponse {
         lines,
@@ -169,10 +271,42 @@ pub struct StatusResponse {
     pub job_id: String,
     pub cmd: String,
     pub args: Vec<String>,
+    /// The client that created the job, when it identified itself. Lets a monitor
+    /// group jobs by Claude Code session — the pid cannot, since sessions share
+    /// one sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub running: bool,
     pub exit_code: Option<i32>,
     pub line_count: usize,
     pub elapsed_ms: u64,
+    /// Milliseconds since the job last produced output. A large and growing
+    /// value on a running job is the signature of a wedged process — without it,
+    /// a job blocked on an unreachable host looks identical to a slow compile.
+    pub idle_ms: u64,
+    /// Child PID while running, so a wedged job can be inspected with `ps`/`lsof`.
+    pub pid: Option<i32>,
+    /// How the job ended: `completed`, `timed_out`, `idle_timed_out`, `canceled`,
+    /// or `failed`. Absent while running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+}
+
+fn summarize(job: &crate::job::Job) -> StatusResponse {
+    let job_state = job.state();
+    StatusResponse {
+        job_id: job.id.clone(),
+        cmd: job.cmd.clone(),
+        args: job.args.clone(),
+        session_id: job.session_id.clone(),
+        running: job_state.is_running(),
+        exit_code: job_state.outcome().and_then(Outcome::exit_code),
+        line_count: job.line_count(),
+        elapsed_ms: job.elapsed_ms(),
+        idle_ms: job.idle_ms(),
+        pid: job.pid(),
+        outcome: job_state.outcome(),
+    }
 }
 
 /// A compact snapshot of a job's progress.
@@ -181,16 +315,7 @@ pub async fn status(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, SidecarError> {
     let job = state.registry.get(&id)?;
-    let job_state = job.state();
-    Ok(Json(StatusResponse {
-        job_id: job.id.clone(),
-        cmd: job.cmd.clone(),
-        args: job.args.clone(),
-        running: job_state.is_running(),
-        exit_code: job_state.outcome().and_then(Outcome::exit_code),
-        line_count: job.line_count(),
-        elapsed_ms: job.elapsed_ms(),
-    }))
+    Ok(Json(summarize(&job)))
 }
 
 // ─── GET /jobs/{id}/stream (SSE) ──────────────────────────────────────────────
@@ -209,6 +334,11 @@ const SSE_REPLAY_CHUNK: usize = 1000;
 /// `Line` events at or past the boundary are forwarded (earlier duplicates are
 /// filtered). A terminal `Finished` event, or an already-terminal state at
 /// subscribe time, emits an `exit` event and closes the stream promptly.
+///
+/// Two kinds of loss are reported rather than hidden. Lines evicted before the
+/// replay window emit a `gap` event; a subscriber that falls behind the
+/// broadcast channel re-reads from the line buffer (which is authoritative)
+/// instead of silently skipping whatever it missed.
 pub async fn stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -224,9 +354,17 @@ pub async fn stream(
         // in-memory tail. In no-spill mode this yields just the retained tail,
         // since older lines were dropped.
         let mut cursor = 0;
+        let mut announced_gap = false;
         while cursor < boundary {
             let want = (boundary - cursor).min(SSE_REPLAY_CHUNK);
-            let (lines, next_from, _dropped) = job.read_window(cursor, want).await;
+            let (lines, next_from, dropped) = job.read_window(cursor, want).await;
+            // Lines evicted before this window are unrecoverable. Say so, once,
+            // before the first surviving line — otherwise a watcher cannot tell
+            // a truncated history from a job that simply started here.
+            if dropped > 0 && !announced_gap {
+                announced_gap = true;
+                yield Ok(gap_event(dropped, next_from.saturating_sub(lines.len())));
+            }
             for line in lines {
                 yield Ok::<Event, Infallible>(line_event(&line));
             }
@@ -243,10 +381,13 @@ pub async fn stream(
             return;
         }
 
+        // Highest index forwarded so far; also the resync cursor after a lag.
+        let mut next = boundary;
         loop {
             match rx.recv().await {
                 Ok(JobEvent::Line(line)) => {
-                    if line.index >= boundary {
+                    if line.index >= next {
+                        next = line.index + 1;
                         yield Ok(line_event(&line));
                     }
                 }
@@ -255,7 +396,25 @@ pub async fn stream(
                     break;
                 }
                 Err(RecvError::Lagged(n)) => {
-                    tracing::warn!(job_id = %id, "sse subscriber lagged by {n} events");
+                    // We missed `n` events, but the lines themselves are still in
+                    // the line buffer. Re-read from `next` rather than resuming
+                    // blind, which would drop them from the stream silently.
+                    tracing::warn!(job_id = %id, "sse subscriber lagged by {n} events; resyncing");
+                    let target = job.next_index();
+                    while next < target {
+                        let want = (target - next).min(SSE_REPLAY_CHUNK);
+                        let (lines, next_from, dropped) = job.read_window(next, want).await;
+                        if dropped > 0 {
+                            yield Ok(gap_event(dropped, next_from.saturating_sub(lines.len())));
+                        }
+                        for line in lines {
+                            yield Ok(line_event(&line));
+                        }
+                        if next_from <= next {
+                            break; // no progress; give up on the resync
+                        }
+                        next = next_from;
+                    }
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -275,6 +434,18 @@ fn line_event(line: &JobLine) -> Event {
         .unwrap_or_else(|_| Event::default().data("{}"))
 }
 
+/// Announce unrecoverable loss: `dropped` lines before `resume_index` were
+/// evicted from the buffer and cannot be replayed.
+fn gap_event(dropped: usize, resume_index: usize) -> Event {
+    let payload = json!({
+        "type": "gap",
+        "dropped": dropped,
+        "resume_index": resume_index,
+        "ts": now_ms(),
+    });
+    Event::default().data(payload.to_string())
+}
+
 fn exit_event(outcome: Outcome) -> Event {
     let payload = json!({
         "type": "exit",
@@ -289,17 +460,18 @@ fn exit_event(outcome: Outcome) -> Event {
 
 /// Cancel a running job by sending SIGKILL to its process group.
 ///
-/// Returns 200 with `{"canceled": true}` if the job was running and the signal
-/// was sent, or 200 with `{"canceled": false}` if the job had already finished.
-/// Returns 404 if the job ID is not found.
+/// `canceled` reports that the job was running and a cancel was requested;
+/// `signalled` reports whether a signal actually reached the process. They can
+/// differ: a cancel arriving before the child has been spawned sets the intent
+/// but has nothing to signal yet. Returns 404 if the job ID is not found.
 pub async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, SidecarError> {
     let job = state.registry.get(&id)?;
     let was_running = job.state().is_running();
-    if was_running {
-        job.cancel();
-    }
-    Ok(Json(json!({ "canceled": was_running, "job_id": id })))
+    let signalled = if was_running { job.cancel() } else { false };
+    Ok(Json(
+        json!({ "canceled": was_running, "signalled": signalled, "job_id": id }),
+    ))
 }
